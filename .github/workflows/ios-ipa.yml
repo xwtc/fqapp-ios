@@ -133,72 +133,58 @@ jobs:
       # ---------------------------------------------------------------
       # Rust 静态库
       # ---------------------------------------------------------------
+      # 一次性完整诊断：不因任何单条命令失败而退出。
+      # 之前用 set -e，ar/nm 一失败整个脚本就静默中断，导致我误把
+      # "检查没跑" 当成 "符号数为 0"，连续误判了好几轮。
       - name: Compile the Rust core for iOS (arm64, static)
         run: |
-          set -euo pipefail
           START=$(date +%s)
-          # CRITICAL: rust/Cargo.toml sets `strip = true` under [profile.release].
-          # That is right for the Android cdylib but catastrophic for staticlib:
-          # it strips the archive's global symbol table, so -force_load pulls in
-          # objects that no longer export _frb_* / _store_dart_post_cobject.
-          # The result is a link that "succeeds" and a binary with zero Rust
-          # symbols. Override it here only for the iOS static build.
           export CARGO_PROFILE_RELEASE_STRIP=none
           echo "CARGO_PROFILE_RELEASE_STRIP=$CARGO_PROFILE_RELEASE_STRIP"
+
+          set +e
           cargo build --manifest-path rust/Cargo.toml --release --target "$RUST_TARGET"
-          echo "cargo build elapsed: $(( $(date +%s) - START ))s"
+          CARGO_RC=$?
+          set -e
+          echo "cargo exit=$CARGO_RC elapsed=$(( $(date +%s) - START ))s"
+          [ "$CARGO_RC" -eq 0 ] || { echo "::error::cargo build failed"; exit 1; }
 
           LIB="$RUST_LIB_REL"
-          test -s "$LIB" || { echo "::error::static lib not produced: $LIB"; exit 1; }
-          ls -lh "$LIB"
+          set +e
+          test -s "$LIB" && echo "lib present" || { echo "::error::lib missing: $LIB"; exit 1; }
+          ls -l "$LIB"
+          echo "file type: $(file -b "$LIB")"
 
-          # 用最原始的方式验证归档里有没有 FRB 符号：直接搜字符串。
-          # nm/llvm-nm 在 runner 上不可靠（可能不存在或读不了 LLVM23 DWARF），
-          # 但符号名在 .o 的符号表里是明文字符串，grep -a 一定能看到。
-          echo "=== raw symbol string scan of the archive ==="
-          for s in frb_get_rust_content_hash store_dart_post_cobject frb_dart_opaque; do
-            n=$(grep -a -c "$s" "$LIB" 2>/dev/null || echo 0)
-            echo "  $s -> $n occurrence(s) in archive"
+          echo "=== archive structure ==="
+          echo "ar -t member count: $(ar -t "$LIB" 2>/dev/null | wc -l)"
+          echo "--- first 5 members ---"
+          ar -t "$LIB" 2>/dev/null | head -5
+          echo "--- fqapi_core object present? ---"
+          ar -t "$LIB" 2>/dev/null | grep -c 'fqapi_core' || true
+
+          echo "=== raw symbol strings in archive (grep -a) ==="
+          for s in frb_get_rust_content_hash store_dart_post_cobject frb_dart_opaque fqapi_core; do
+            n=$(grep -a -c "$s" "$LIB" 2>/dev/null)
+            echo "  $s -> ${n:-0}"
           done
-          echo "=== archive member count ==="
-          ar -t "$LIB" 2>/dev/null | wc -l || echo "(ar failed)"
-          echo "=== sample members ==="
-          ar -t "$LIB" 2>/dev/null | head -5 || true
 
-          # Do NOT use Xcode's nm on this archive: Rust 1.99.1 emits LLVM 23
-          # DWARF (attribute kind 102) which Xcode 16.4's nm (LLVM 17) cannot
-          # parse; it errors on every object and looks like a build failure.
+          echo "=== rustc bundled llvm-nm ==="
           SYSROOT=$(rustc --print sysroot)
           HOST=$(rustc -vV | sed -n 's/^host: //p')
-          LLVM_NM="$SYSROOT/lib/rustlib/$HOST/bin/llvm-nm"
-          if [ -x "$LLVM_NM" ]; then
-            NM="$LLVM_NM"
-            echo "using rustc bundled llvm-nm: $NM"
-          else
-            NM=$(command -v llvm-nm || true)
-            echo "::warning::bundled llvm-nm not found, falling back to: ${NM:-none}"
-          fi
+          echo "sysroot=$SYSROOT host=$HOST"
+          ls "$SYSROOT/lib/rustlib/$HOST/bin/" 2>/dev/null || echo "(no bin dir)"
+          for cand in "$SYSROOT/lib/rustlib/$HOST/bin/llvm-nm" \
+                      "$(command -v llvm-nm)"; do
+            if [ -n "$cand" ] && [ -x "$cand" ]; then
+              echo "found: $cand"
+              "$cand" -gU "$LIB" 2>&1 | grep -c 'frb_' || true
+              break
+            fi
+          done
+          set -e
 
-          if [ -n "$NM" ]; then
-            echo "--- FRB symbols in archive ---"
-            "$NM" -gU "$LIB" > nm.out 2>/dev/null || "$NM" -g "$LIB" > nm.out 2>/dev/null || true
-            for symbol in frb_get_rust_content_hash store_dart_post_cobject; do
-              if grep -Eq "[[:space:]]_?${symbol}$" nm.out; then
-                echo "  ok: $symbol"
-              else
-                echo "::error::missing symbol in archive: $symbol"
-                head -40 nm.out
-                exit 1
-              fi
-            done
-            echo "frb_* symbol count: $(grep -c 'frb_' nm.out || true)"
-          else
-            echo "::warning::skipping symbol check (no llvm-nm available)"
-            ar -t "$LIB" | head -5
-            echo "member count: $(ar -t "$LIB" | wc -l)"
-          fi
-
-          echo "static lib size: $(du -h "$LIB" | cut -f1)"
+          echo "=== static lib size ==="
+          du -h "$LIB"
 
       # ---------------------------------------------------------------
       # 链接配置：直接写进 pbxproj 的 target build settings

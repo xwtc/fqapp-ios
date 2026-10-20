@@ -168,6 +168,41 @@ jobs:
             echo "  $s -> ${n:-0}"
           done
 
+          # ---- 关键诊断：符号到底在哪个 .o 里，以及归档是否被 thin/LTO 改写 ----
+          echo "=== per-object symbol scan (first 40 members) ==="
+          mkdir -p /tmp/objscan
+          ar -t "$LIB" 2>/dev/null | head -40 | while read -r m; do
+            [ -z "$m" ] && continue
+            if ar -p "$LIB" "$m" 2>/dev/null | grep -aq 'frb_get_rust_content_hash'; then
+              echo "  HIT: $m"
+            fi
+          done
+          echo "(end per-object scan)"
+
+          echo "=== is this a thin archive / does it have a symdef table? ==="
+          head -c 8 "$LIB" | od -c | head -2
+          echo "--- archive magic (first 8 bytes as text) ---"
+          head -c 8 "$LIB" 2>/dev/null | tr -d '\0' || true
+          echo ""
+          echo "--- first 200 bytes hexdump ---"
+          head -c 200 "$LIB" | od -A d -t x1z | head -8
+
+          echo "=== does the crate export the symbol at all? check the built rlib ==="
+          ls -l rust/target/aarch64-apple-ios/release/libfqapi_core.rlib 2>/dev/null || echo "(no rlib)"
+          RLIB=rust/target/aarch64-apple-ios/release/libfqapi_core.rlib
+          if [ -f "$RLIB" ]; then
+            echo "rlib frb_get_rust_content_hash occurrences: $(grep -a -c 'frb_get_rust_content_hash' "$RLIB" 2>/dev/null)"
+            echo "rlib store_dart_post_cobject occurrences: $(grep -a -c 'store_dart_post_cobject' "$RLIB" 2>/dev/null)"
+          fi
+
+          echo "=== does the cdylib export it? (sanity: same crate, dynamic form) ==="
+          SO=rust/target/aarch64-apple-ios/release/libfqapi_core.dylib
+          if [ -f "$SO" ]; then
+            echo "dylib frb_ occurrences: $(grep -a -c 'frb_get_rust_content_hash' "$SO" 2>/dev/null)"
+          else
+            echo "(no dylib built)"
+          fi
+
           echo "=== rustc bundled llvm-nm ==="
           SYSROOT=$(rustc --print sysroot)
           HOST=$(rustc -vV | sed -n 's/^host: //p')

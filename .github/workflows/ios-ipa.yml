@@ -180,39 +180,81 @@ jobs:
           echo "static lib size: $(du -h "$LIB" | cut -f1)"
 
       # ---------------------------------------------------------------
-      # 链接配置：写进 Flutter 的 xcconfig，不走 CocoaPods
+      # 链接配置：直接写进 pbxproj 的 target build settings
+      #
+      # 前几轮只改 ios/Flutter/Release.xcconfig，但主二进制始终 1.1MB、
+      # frb_ 符号数为 0，说明那行没有生效。xcconfig 的优先级低于
+      # target 级 buildSettings，且 CocoaPods 生成的 Pods-Runner.xcconfig
+      # 会参与合并。所以这里直接写 pbxproj，优先级最高、不依赖合并顺序。
       # ---------------------------------------------------------------
-      - name: Link the static library via xcconfig
+      - name: Link the static library into the Runner target
         run: |
           set -euo pipefail
-          # $(SRCROOT) 对 Runner target 是 ios/，所以 ../rust/... 指向仓库根。
-          # -Wl,-force_load,<path> 作为单个 token，避免路径含空格时被拆开。
-          #
-          # 重要：注释必须全部是 ASCII。
-          # 之前这里写中文注释，在 Windows 上被写成 GBK 字节，macOS 按 UTF-8
-          # 解析时末尾字符损坏成 "?"，把换行吞掉，导致下一行 OTHER_LDFLAGS
-          # 被并入注释 —— 链接参数静默失效，二进制里没有任何 frb_ 符号。
-          FLAGS='OTHER_LDFLAGS = $(inherited) -Wl,-force_load,$(SRCROOT)/../rust/target/aarch64-apple-ios/release/libfqapi_core.a'
+          LIB_ABS="$(cd rust && pwd)/target/aarch64-apple-ios/release/libfqapi_core.a"
+          echo "LIB_ABS=$LIB_ABS"
+          ls -lh "$LIB_ABS" || { echo "::error::static lib missing"; exit 1; }
 
-          for cfg in ios/Flutter/Release.xcconfig ios/Flutter/Debug.xcconfig; do
-            if [ -f "$cfg" ]; then
-              if ! grep -q 'force_load' "$cfg"; then
-                printf '\n// fqapp: static-link the Rust core (force_load required, Dart resolves symbols by name)\n%s\n' \
-                  "$FLAGS" >> "$cfg"
-              fi
-              echo "--- $cfg ---"
-              cat "$cfg"
-              echo "--- check: OTHER_LDFLAGS must be a live (uncommented) line ---"
-              if grep -qE '^OTHER_LDFLAGS *=.*force_load' "$cfg"; then
-                echo "  OK"
-              else
-                echo "::error::OTHER_LDFLAGS in $cfg is not an active line"
-                exit 1
-              fi
-            else
-              echo "::warning::missing $cfg"
-            fi
-          done
+          python3 - "$LIB_ABS" <<'PY'
+          import sys, pathlib
+
+          lib = sys.argv[1]
+          flag = '-Wl,-force_load,%s' % lib
+          p = pathlib.Path('ios/Runner.xcodeproj/project.pbxproj')
+          lines = p.read_text().split('\n')
+
+          out = []
+          in_cfg = False
+          is_flutter_cfg = False
+          injected = 0
+
+          for line in lines:
+              out.append(line)
+              if 'isa = XCBuildConfiguration;' in line:
+                  in_cfg = True
+                  is_flutter_cfg = False
+              elif in_cfg and 'baseConfigurationReference' in line:
+                  if 'Flutter/' in line:
+                      is_flutter_cfg = True
+              elif in_cfg and line.strip() == 'buildSettings = {' and is_flutter_cfg:
+                  out.append('\t\t\t\tOTHER_LDFLAGS = (')
+                  out.append('\t\t\t\t\t"$(inherited)",')
+                  out.append('\t\t\t\t\t"%s",' % flag)
+                  out.append('\t\t\t\t);')
+                  injected += 1
+                  in_cfg = False
+                  is_flutter_cfg = False
+
+          p.write_text('\n'.join(out))
+          print('injected OTHER_LDFLAGS into %d build configurations' % injected)
+          if injected == 0:
+              print('::error::no Flutter build configuration found in pbxproj')
+              sys.exit(1)
+          PY
+
+          echo "--- pbxproj check ---"
+          grep -c 'force_load' ios/Runner.xcodeproj/project.pbxproj || true
+          grep -n 'force_load' ios/Runner.xcodeproj/project.pbxproj | head -5
+
+      # 实测：pod install 之后 Xcode 实际看到的 OTHER_LDFLAGS 是什么。
+      # 这一步是诊断，不通过也要继续，但结果决定后续怎么修。
+      - name: Diagnose effective link settings
+        run: |
+          set -eo pipefail
+          flutter build ios --config-only --release --no-codesign 2>&1 | tail -20 || true
+
+          echo "=== xcodebuild -showBuildSettings | OTHER_LDFLAGS ==="
+          xcodebuild -showBuildSettings \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release 2>/dev/null \
+            | grep -i 'OTHER_LDFLAGS' || echo "(OTHER_LDFLAGS not found in showBuildSettings)"
+
+          echo "=== showBuildSettings | LIBRARY_SEARCH_PATHS ==="
+          xcodebuild -showBuildSettings \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release 2>/dev/null \
+            | grep -i 'LIBRARY_SEARCH_PATHS' || echo "(none)"
 
       - name: Bump the iOS deployment target
         run: |

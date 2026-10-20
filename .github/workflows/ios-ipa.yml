@@ -90,6 +90,285 @@ jobs:
           sw_vers
           xcode-select -p
 
+      # ---------------------------------------------------------------
+      # 自带一个不依赖 nm 的符号读取器。
+      #
+      # 前几轮用 `grep -a -c` 判定符号是否存在，得到 0。但 macOS 自带 BSD grep，
+      # 在 94MB、几乎没有换行符的归档上不可靠，且无法区分「真的没有」和「读不了」。
+      # 更关键的是：Xcode 15/16 的 nm 读不了 Rust 1.99.1（LLVM 23）的 DWARF。
+      #
+      # 这里改成自己解析：
+      #   1) bytes.count 纯字节子串计数（语义完全确定）
+      #   2) ar 归档的 __.SYMDEF 索引 —— 归档自己声明的导出表，
+      #      链接器看到的就是它。这是最决定性的证据。
+      #   3) 逐个成员的 Mach-O LC_SYMTAB 符号表
+      # 三条互相印证。--require-frb 在没有 frb* 符号时以 2 退出。
+      #
+      # 解析器已在本地用合成 Mach-O/ar 固件验证过（test_machosym.py）。
+      # ---------------------------------------------------------------
+      - name: Write the Mach-O symbol reader
+        run: |
+          cat > /tmp/machosym.py <<'PY'
+          """Read the symbols out of a Mach-O image or a classic ar archive.
+
+          Why this exists: the runner's `nm` cannot read Rust 1.99.1 objects (LLVM 23
+          DWARF vs Xcode's LLVM 17 reader), and `grep -a` on a 94 MB archive conflates
+          "absent" with "unreadable". Both failure modes look like a clean zero.
+
+          This parser only uses bytes.count and struct.unpack_from on the documented
+          Mach-O / ar layouts, so a zero is a real zero.
+
+          Exit codes:
+              0  ran to completion (and, with --require-frb, found an frb* symbol)
+              2  --require-frb was given and no frb* symbol exists
+          """
+
+          import struct
+          import sys
+
+          MAGIC64 = 0xfeedfacf
+          MAGIC32 = 0xfeedface
+          FAT_BE = (0xcafebabe, 0xcafebabf)
+          LC_SYMTAB = 0x2
+          AR_MAGIC = b'!<arch>\n'
+
+
+          def macho_syms(buf, base=0):
+              """Return externally visible, defined symbol names of one Mach-O image."""
+              if len(buf) - base < 28:
+                  return None
+              magic = struct.unpack_from('<I', buf, base)[0]
+              if magic == MAGIC64:
+                  is64, hdr = True, 32
+              elif magic == MAGIC32:
+                  is64, hdr = False, 28
+              else:
+                  return None
+              ncmds = struct.unpack_from('<I', buf, base + 16)[0]
+              off = base + hdr
+              out = []
+              for _ in range(ncmds):
+                  if off + 8 > len(buf):
+                      break
+                  cmd, cmdsize = struct.unpack_from('<II', buf, off)
+                  if cmdsize < 8:
+                      break
+                  if cmd == LC_SYMTAB and off + 24 <= len(buf):
+                      symoff, nsyms, stroff, _strsize = struct.unpack_from('<IIII', buf, off + 8)
+                      entsz = 16 if is64 else 12
+                      for i in range(nsyms):
+                          p = base + symoff + i * entsz
+                          if p + entsz > len(buf):
+                              break
+                          if is64:
+                              strx, ntype, _nsect, _ndesc, _nval = struct.unpack_from('<IBBhQ', buf, p)
+                          else:
+                              strx, ntype, _nsect, _ndesc, _nval = struct.unpack_from('<IBBhI', buf, p)
+                          # N_STAB debug entries (0xe0 mask) are not linkable symbols;
+                          # N_EXT must be set; N_UNDF means the symbol is imported, not
+                          # defined here. Only external defined symbols matter to us.
+                          if ntype & 0xe0:
+                              continue
+                          if not ntype & 0x01:
+                              continue
+                          if (ntype & 0x0e) == 0x00:
+                              continue
+                          s = base + stroff + strx
+                          if s >= len(buf):
+                              continue
+                          e = buf.find(b'\x00', s)
+                          if e < 0:
+                              continue
+                          out.append(buf[s:e].decode('utf-8', 'replace'))
+                  off += cmdsize
+              return out
+
+
+          def ar_members(data):
+              """Return [(name, body_offset, size)] for a classic ar archive."""
+              if not data.startswith(AR_MAGIC):
+                  return None
+              pos, out = 8, []
+              while pos + 60 <= len(data):
+                  hdr = data[pos:pos + 60]
+                  if hdr[58:60] != b'`\n':
+                      break
+                  name = hdr[0:16].decode('ascii', 'replace').strip()
+                  try:
+                      size = int(hdr[48:58].decode('ascii').strip())
+                  except ValueError:
+                      break
+                  body = pos + 60
+                  if name.startswith('#1/'):
+                      try:
+                          nlen = int(name[3:])
+                      except ValueError:
+                          nlen = 0
+                      name = data[body:body + nlen].decode('utf-8', 'replace').rstrip('\x00')
+                      body += nlen
+                      size -= nlen
+                  out.append((name, body, size))
+                  pos = body + size
+                  if size % 2:
+                      pos += 1
+              return out
+
+
+          def symdef_names(buf):
+              """Parse a ranlib __.SYMDEF table: repeated (uint32 len, name bytes)."""
+              names = []
+              pos = 0
+              while pos + 4 <= len(buf):
+                  (n,) = struct.unpack_from('<I', buf, pos)
+                  pos += 4
+                  if n == 0 or n > 4096 or pos + n > len(buf):
+                      break
+                  names.append(buf[pos:pos + n].rstrip(b'\x00').decode('utf-8', 'replace'))
+                  pos += n
+              return names
+
+
+          def report_archive(data, members, want):
+              print('  format: ar archive, %d member(s)' % len(members))
+              print('  first members: %s' % ', '.join(m[0] for m in members[:4]))
+
+              # The ranlib index is the archive's own declaration of what it exports.
+              # The linker resolves against exactly this, so it is the most decisive
+              # artifact here and is independent of any nm/LLVM version mismatch.
+              index = [m for m in members if 'SYMDEF' in m[0]]
+              index_names = []
+              if index:
+                  name, body, size = index[0]
+                  index_names = symdef_names(data[body:body + size])
+                  frb_index = sorted(n for n in index_names if 'frb' in n)
+                  print('  ranlib index "%s": %d entries, %d mention frb'
+                        % (name, len(index_names), len(frb_index)))
+                  for n in frb_index:
+                      print('    %s' % n)
+                  # A stripped index is empty; showing real entries separates
+                  # "stripped" from "my parser is wrong".
+                  print('  index sample: %s'
+                        % (', '.join(index_names[:8]) if index_names else '(empty)'))
+              else:
+                  print('  ranlib index: ABSENT (archive has no __.SYMDEF)')
+
+              hits, macho = {}, 0
+              not_macho = []
+              for name, body, size in members:
+                  syms = macho_syms(data[body:body + size])
+                  if syms is None:
+                      if size >= 4:
+                          not_macho.append((name, data[body:body + 4].hex()))
+                      continue
+                  macho += 1
+                  for s in syms:
+                      if 'frb' in s:
+                          hits.setdefault(s, []).append(name)
+              print('  Mach-O object members: %d of %d' % (macho, len(members)))
+              if not_macho:
+                  # Not Mach-O means LTO emitted LLVM bitcode, or the member is an index.
+                  # 'bc c0 de' is bitcode; a Mach-O header starts 0xcffaedfe (LE cffaedfe
+                  # reads as cffaedfe bytes) so anything else here is worth naming.
+                  print('  non-Mach-O members: %d (first 5: %s)'
+                        % (len(not_macho),
+                           ', '.join('%s[%s]' % (n[:28], h) for n, h in not_macho[:5])))
+              print('  distinct frb* symbols in object symbol tables: %d' % len(hits))
+              for s in sorted(hits):
+                  print('    %s  (%d member(s), e.g. %s)' % (s, len(hits[s]), hits[s][0]))
+              for w in want:
+                  print('  objects contain %-30s -> %d' % (w, len(hits.get(w, []))))
+
+              # Dump the head of the crate's own object: the single fastest way to tell
+              # a Mach-O object (fe ed fa cf) from LTO bitcode (de c0 17 0b) from a
+              # stripped-to-nothing member.
+              for name, body, size in members:
+                  if 'fqapi_core' in name and size > 32:
+                      print('  crate object "%s" head: %s'
+                            % (name, data[body:body + 32].hex()))
+                      break
+              return bool(hits)
+
+
+          def report_macho(data):
+              syms = macho_syms(data)
+              if syms is None:
+                  print('  format: neither Mach-O nor ar')
+                  return False
+              frb = sorted(s for s in syms if 'frb' in s)
+              print('  format: Mach-O image')
+              print('  external defined symbols: %d' % len(syms))
+              print('  external defined frb*: %d' % len(frb))
+              for s in frb:
+                  print('    %s' % s)
+              return bool(frb)
+
+
+          def report_fat(data, n):
+              print('  format: fat binary, %d slice(s)' % n)
+              found = False
+              for i in range(n):
+                  o = 8 + i * 20
+                  if o + 20 > len(data):
+                      break
+                  cpu, _cpusub, off, size, _align = struct.unpack_from('>iiIII', data, o)
+                  syms = macho_syms(data, off) or []
+                  frb = sorted(s for s in syms if 'frb' in s)
+                  print('  slice %d cputype=%d off=%d size=%d -> %d frb* symbol(s)'
+                        % (i, cpu, off, size, len(frb)))
+                  for s in frb:
+                      print('    %s' % s)
+                  found = found or bool(frb)
+              return found
+
+
+          def scan(path, want):
+              try:
+                  data = open(path, 'rb').read()
+              except OSError as exc:
+                  print('SKIP %s (%s)' % (path, exc))
+                  return False
+              print('')
+              print('=== %s ===' % path)
+              print('  bytes: %d' % len(data))
+              for probe in want:
+                  print('  raw substring %-32s -> %d' % (probe, data.count(probe.encode())))
+              # A mangled Rust symbol proves the symbol table survived whatever ran.
+              # If _ZN is present but no frb_ is, the frb_ functions are genuinely
+              # absent rather than unreadable.
+              print('  raw substring %-32s -> %d' % ('_ZN (mangled)', data.count(b'_ZN')))
+              if len(data) >= 8 and struct.unpack_from('>I', data, 0)[0] in FAT_BE:
+                  return report_fat(data, struct.unpack_from('>I', data, 4)[0])
+              members = ar_members(data)
+              if members is not None:
+                  return report_archive(data, members, want)
+              return report_macho(data)
+
+
+          def main(argv):
+              want = [a[len('--want='):] for a in argv if a.startswith('--want=')]
+              require = '--require-frb' in argv
+              paths = [a for a in argv if not a.startswith('--')]
+              if not paths:
+                  print('usage: machosym.py [--require-frb] [--want=SYM]... PATH...')
+                  return 1
+              found = False
+              for p in paths:
+                  if scan(p, want):
+                      found = True
+              print('')
+              if require and not found:
+                  print('VERDICT: FAIL - no frb* symbol in any scanned artifact')
+                  return 2
+              print('VERDICT: %s' % ('frb* symbols found' if found else 'none found'))
+              return 0
+
+
+          if __name__ == '__main__':
+              sys.exit(main(sys.argv[1:]))
+
+          PY
+          python3 -c "import ast; ast.parse(open('/tmp/machosym.py').read()); print('machosym.py parses OK')"
+
       - name: Install the pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -139,95 +418,100 @@ jobs:
       - name: Compile the Rust core for iOS (arm64, static)
         run: |
           START=$(date +%s)
-          export CARGO_PROFILE_RELEASE_STRIP=none
-          echo "CARGO_PROFILE_RELEASE_STRIP=$CARGO_PROFILE_RELEASE_STRIP"
 
+          # rust/Cargo.toml pins strip = true in [profile.release], and the repo
+          # forbids editing that file (it would diverge from the Android build).
+          # CARGO_PROFILE_RELEASE_STRIP is the documented override, but on a
+          # cargo that predates the knob it is accepted and ignored, which is
+          # exactly the silent failure we have been chasing. So set it AND pass
+          # -Cstrip=none straight to rustc: RUSTFLAGS is appended after cargo's
+          # own codegen flags, so the last value wins regardless of cargo's
+          # version.
+          export CARGO_PROFILE_RELEASE_STRIP=none
+          export RUSTFLAGS="${RUSTFLAGS:-} -Cstrip=none -Cdebuginfo=0"
+          echo "CARGO_PROFILE_RELEASE_STRIP=$CARGO_PROFILE_RELEASE_STRIP"
+          echo "RUSTFLAGS=$RUSTFLAGS"
+
+          # Prove the flag reached rustc rather than being dropped: ask cargo to
+          # print the exact rustc invocation for this crate.
+          #
+          # pipefail + PIPESTATUS: `$?` after a pipeline is the last command's
+          # status (tail), not cargo's. Without this the build verdict is tail's
+          # and a failing compile would look like a success.
+          set -o pipefail
           set +e
-          cargo build --manifest-path rust/Cargo.toml --release --target "$RUST_TARGET"
-          CARGO_RC=$?
+          cargo build --manifest-path rust/Cargo.toml --release \
+            --target "$RUST_TARGET" -v 2>&1 | tee /tmp/cargo-verbose.log | tail -5
+          CARGO_RC=${PIPESTATUS[0]}
           set -e
           echo "cargo exit=$CARGO_RC elapsed=$(( $(date +%s) - START ))s"
           [ "$CARGO_RC" -eq 0 ] || { echo "::error::cargo build failed"; exit 1; }
+
+          echo "=== did -Cstrip=none reach rustc for fqapi_core? ==="
+          grep -a 'fqapi_core' /tmp/cargo-verbose.log \
+            | grep -a 'rustc' | head -2 || echo "(no fqapi_core rustc line found)"
+          if grep -a 'fqapi_core' /tmp/cargo-verbose.log | grep -qa 'strip=none'; then
+            echo "OK: -Cstrip=none is on the fqapi_core rustc command line"
+          else
+            echo "::error::strip=none did NOT reach rustc; symbols may be stripped"
+          fi
 
           LIB="$RUST_LIB_REL"
           set +e
           test -s "$LIB" && echo "lib present" || { echo "::error::lib missing: $LIB"; exit 1; }
           ls -l "$LIB"
           echo "file type: $(file -b "$LIB")"
+          echo "=== static lib size ==="
+          du -h "$LIB"
 
           echo "=== archive structure ==="
           echo "ar -t member count: $(ar -t "$LIB" 2>/dev/null | wc -l)"
           echo "--- first 5 members ---"
           ar -t "$LIB" 2>/dev/null | head -5
-          echo "--- fqapi_core object present? ---"
-          ar -t "$LIB" 2>/dev/null | grep -c 'fqapi_core' || true
 
-          echo "=== raw symbol strings in archive (grep -a) ==="
-          for s in frb_get_rust_content_hash store_dart_post_cobject frb_dart_opaque fqapi_core; do
-            n=$(grep -a -c "$s" "$LIB" 2>/dev/null)
-            echo "  $s -> ${n:-0}"
-          done
-
-          # ---- 关键诊断：符号到底在哪个 .o 里，以及归档是否被 thin/LTO 改写 ----
-          echo "=== per-object symbol scan (first 40 members) ==="
-          mkdir -p /tmp/objscan
-          ar -t "$LIB" 2>/dev/null | head -40 | while read -r m; do
-            [ -z "$m" ] && continue
-            if ar -p "$LIB" "$m" 2>/dev/null | grep -aq 'frb_get_rust_content_hash'; then
-              echo "  HIT: $m"
-            fi
-          done
-          echo "(end per-object scan)"
-
-          echo "=== is this a thin archive / does it have a symdef table? ==="
-          head -c 8 "$LIB" | od -c | head -2
-          echo "--- archive magic (first 8 bytes as text) ---"
-          head -c 8 "$LIB" 2>/dev/null | tr -d '\0' || true
+          # 决定性检查：自己解析 ar + Mach-O 符号表。
+          # 之前用 `grep -a -c` 判定，在 94MB、几乎没有换行的二进制上不可靠，
+          # 而且它无法区分「真的没有」和「读不了」。machosym.py 用 bytes.count
+          # 做纯字节子串计数，再解析 LC_SYMTAB / __.SYMDEF 拿真实导出符号名。
+          #
+          # set +e 包住：--require-frb 在缺符号时以 2 退出，set -e 会在
+          # AUDIT_LIB=$? 之前就终止脚本，那就又变成"检查没跑"了。
+          set +e
           echo ""
-          echo "--- first 200 bytes hexdump ---"
-          head -c 200 "$LIB" | od -A d -t x1z | head -8
+          echo "########## staticlib symbol audit ##########"
+          python3 /tmp/machosym.py --require-frb \
+            --want=frb_get_rust_content_hash \
+            --want=frb_pde_ffi_dispatcher_primary \
+            --want=store_dart_post_cobject \
+            "$LIB"
+          AUDIT_LIB=$?
+          echo "staticlib audit exit=$AUDIT_LIB"
 
-          echo "=== does the crate export the symbol at all? check the built rlib ==="
-          ls -l rust/target/aarch64-apple-ios/release/libfqapi_core.rlib 2>/dev/null || echo "(no rlib)"
+          echo ""
+          echo "########## rlib symbol audit ##########"
           RLIB=rust/target/aarch64-apple-ios/release/libfqapi_core.rlib
           if [ -f "$RLIB" ]; then
-            echo "rlib frb_get_rust_content_hash occurrences: $(grep -a -c 'frb_get_rust_content_hash' "$RLIB" 2>/dev/null)"
-            echo "rlib store_dart_post_cobject occurrences: $(grep -a -c 'store_dart_post_cobject' "$RLIB" 2>/dev/null)"
+            python3 /tmp/machosym.py "$RLIB"
+          else
+            echo "(no rlib built)"
           fi
 
-          echo "=== does the cdylib export it? (sanity: same crate, dynamic form) ==="
+          echo ""
+          echo "########## cdylib symbol audit ##########"
           SO=rust/target/aarch64-apple-ios/release/libfqapi_core.dylib
           if [ -f "$SO" ]; then
-            echo "dylib frb_ occurrences: $(grep -a -c 'frb_get_rust_content_hash' "$SO" 2>/dev/null)"
+            python3 /tmp/machosym.py "$SO"
           else
             echo "(no dylib built)"
           fi
-
-          echo "=== rustc bundled llvm-nm ==="
-          SYSROOT=$(rustc --print sysroot)
-          HOST=$(rustc -vV | sed -n 's/^host: //p')
-          echo "sysroot=$SYSROOT host=$HOST"
-          ls "$SYSROOT/lib/rustlib/$HOST/bin/" 2>/dev/null || echo "(no bin dir)"
-          for cand in "$SYSROOT/lib/rustlib/$HOST/bin/llvm-nm" \
-                      "$(command -v llvm-nm)"; do
-            if [ -n "$cand" ] && [ -x "$cand" ]; then
-              echo "found: $cand"
-              "$cand" -gU "$LIB" 2>&1 | grep -c 'frb_' || true
-              break
-            fi
-          done
           set -e
 
-          echo "=== static lib size ==="
-          du -h "$LIB"
+          # 静态库缺 frb_* 就没必要继续跑了：后面所有步骤都会失败。
+          if [ "$AUDIT_LIB" -ne 0 ]; then
+            echo "::error::the staticlib exports no frb_* symbol; the link would produce an empty core"
+            exit 1
+          fi
 
-      # ---------------------------------------------------------------
-      # 链接配置：直接写进 pbxproj 的 target build settings
-      #
-      # 前几轮只改 ios/Flutter/Release.xcconfig，但主二进制始终 1.1MB、
-      # frb_ 符号数为 0，说明那行没有生效。xcconfig 的优先级低于
-      # target 级 buildSettings，且 CocoaPods 生成的 Pods-Runner.xcconfig
-      # 会参与合并。所以这里直接写 pbxproj，优先级最高、不依赖合并顺序。
       # ---------------------------------------------------------------
       - name: Link the static library into the Runner target
         run: |
@@ -244,7 +528,6 @@ jobs:
           import sys, pathlib
 
           lib, pbx_path = sys.argv[1], sys.argv[2]
-          flag = '-Wl,-force_load,%s' % lib
           p = pathlib.Path(pbx_path)
           text = p.read_text()
 
@@ -252,13 +535,51 @@ jobs:
               print('pbxproj already patched')
               sys.exit(0)
 
-          inject = (
-              'buildSettings = {\n'
-              '\t\t\t\tOTHER_LDFLAGS = (\n'
-              '\t\t\t\t\t"$(inherited)",\n'
-              '\t\t\t\t\t"%s",\n'
-              '\t\t\t\t);' % flag
+          # -force_load puts every archive member on the linker's table, but ld
+          # then runs its dead_strip pass. Nothing in the ObjC shell references
+          # frb_*, so the whole Rust core is unreachable and gets removed
+          # again -- that is why the main binary stayed at 1.1 MB even though
+          # -force_load was visibly present in OTHER_LDFLAGS.
+          #
+          # -Wl,-u,_<sym> creates a required undefined reference. dead_strip
+          # treats such symbols as roots, so the symbol and everything it
+          # reaches survive. If the archive really lacks the symbol the link
+          # fails loudly instead of silently producing an empty core, which
+          # also makes this the decisive experiment.
+          #
+          # Deliberately NOT setting DEAD_CODE_STRIPPING = NO: that would keep
+          # all 94 MB of the archive and bloat the app for no benefit. Roots
+          # plus normal dead_strip keep exactly the reachable subset.
+          #
+          # The list is every symbol the Dart side looks up; see
+          # generalized_frb_rust_binding/_io.dart in flutter_rust_bridge 2.13.0.
+          ANCHORS = (
+              'frb_get_rust_content_hash',
+              'frb_pde_ffi_dispatcher_primary',
+              'frb_pde_ffi_dispatcher_sync',
+              'frb_dart_fn_deliver_output',
+              'frb_create_shutdown_callback',
+              'frb_init_frb_dart_api_dl',
+              'frb_free_wire_sync_rust2dart_dco',
+              'frb_free_wire_sync_rust2dart_sse',
+              'frb_dart_opaque_dart2rust_encode',
+              'frb_dart_opaque_rust2dart_decode',
+              'frb_dart_opaque_drop_thread_box_persistent_handle',
+              'frb_rust_vec_u8_new',
+              'frb_rust_vec_u8_resize',
+              'frb_rust_vec_u8_free',
+              'store_dart_post_cobject',
           )
+          lines = [
+              'buildSettings = {',
+              '\t\t\t\tOTHER_LDFLAGS = (',
+              '\t\t\t\t\t"$(inherited)",',
+              '\t\t\t\t\t"-Wl,-force_load,%s",' % lib,
+          ]
+          for name in ANCHORS:
+              lines.append('\t\t\t\t\t"-Wl,-u,_%s",' % name)
+          lines.append('\t\t\t\t);')
+          inject = '\n'.join(lines)
 
           # Split into XCBuildConfiguration blocks by locating the isa line and
           # walking to the matching closing brace.
@@ -305,7 +626,8 @@ jobs:
 
           echo "=== after patch ==="
           grep -c 'force_load' "$PBX" || true
-          grep -n -A4 'OTHER_LDFLAGS' "$PBX" | head -30
+          grep -c 'Wl,-u,_frb_' "$PBX" || true
+          grep -n -A22 'OTHER_LDFLAGS' "$PBX" | head -30
 
       # 构建前先确认 Xcode 真的读到了这个设置。
       # 这是决定性证据：如果 showBuildSettings 里没有 force_load，
@@ -326,6 +648,12 @@ jobs:
             echo "OK: force_load is visible to Xcode"
           else
             echo "::error::force_load NOT visible to Xcode; link flag will not take effect"
+            exit 1
+          fi
+          if echo "$SETTINGS" | grep -q -- '-u,_frb_get_rust_content_hash'; then
+            echo "OK: the -u anchor is visible to Xcode"
+          else
+            echo "::error::the -u anchor is missing; dead_strip would remove the Rust core again"
             exit 1
           fi
 
@@ -474,69 +802,46 @@ jobs:
           ls -la build/ios/iphoneos/
 
       # 关键校验：不用装机就能知道静态链接成没成。
+      # 这里用同一个 machosym.py 解析主二进制的 Mach-O 符号表，
+      # 而不是 `grep -a`：后者在几十 MB 的二进制上不可靠，
+      # 会把「读不到」和「不存在」混成同一个 0。
       - name: Verify the Rust symbols reached the main binary
         run: |
-          # No -u: an empty var must print diagnostics, not exit silently.
           set -eo pipefail
           BIN=build/ios/iphoneos/Runner.app/Runner
           echo "BIN=$BIN"
           ls -lh "$BIN" || { echo "::error::main binary not found: $BIN"; ls -R build/ios/iphoneos/ | head -40; exit 1; }
 
-          echo "--- tool discovery ---"
-          echo "rustc: $(command -v rustc || echo '(not found)')"
-          SYSROOT="$(rustc --print sysroot 2>/dev/null || true)"
-          HOST="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p' || true)"
-          echo "SYSROOT=$SYSROOT"
-          echo "HOST=$HOST"
+          echo "--- binary info ---"
+          file "$BIN"
 
-          NM=""
-          for cand in \
-            "$SYSROOT/lib/rustlib/$HOST/bin/llvm-nm" \
-            "$SYSROOT/lib/rustlib/$HOST/bin/rust-llvm-nm" \
-            "$(command -v llvm-nm 2>/dev/null || true)" \
-            /opt/homebrew/opt/llvm/bin/llvm-nm \
-            /usr/local/opt/llvm/bin/llvm-nm
-          do
-            if [ -n "$cand" ] && [ -x "$cand" ]; then NM="$cand"; break; fi
-          done
-          echo "NM=$NM"
-
-          # Prefer llvm-nm; fall back to Xcode nm (the main binary is an ld
-          # product and carries no Rust DWARF, so Xcode nm can read it).
-          if [ -n "$NM" ]; then
-            "$NM" -gU "$BIN" > symbols.txt 2>/dev/null || "$NM" -g "$BIN" > symbols.txt 2>/dev/null || true
-          fi
-          if [ ! -s symbols.txt ]; then
-            echo "llvm-nm unavailable or empty; falling back to nm -gU"
-            nm -gU "$BIN" > symbols.txt 2>/dev/null || nm -g "$BIN" > symbols.txt 2>/dev/null || true
-          fi
-          echo "symbol lines: $(wc -l < symbols.txt || echo 0)"
-
-          # nm 在 runner 上不可靠，这里直接用二进制字符串扫描做兜底判定。
-          echo "=== raw scan of the main binary ==="
-          for s in frb_get_rust_content_hash store_dart_post_cobject fqapi_core; do
-            n=$(grep -a -c "$s" "$BIN" 2>/dev/null || echo 0)
-            echo "  $s -> $n occurrence(s)"
-          done
-
-          if grep -q "frb_get_rust_content_hash" symbols.txt \
-             || grep -aq "frb_get_rust_content_hash" "$BIN"; then
-            echo "OK: Rust symbols linked into the main binary"
-            echo "frb_* symbol count: $(grep -c 'frb_' symbols.txt || true)"
-          else
-            echo "::error::no Rust symbols in the main binary; force_load did not take effect"
-            echo "--- current link flags ---"
-            cat ios/Flutter/Release.xcconfig || true
-            echo "--- frb symbols found ---"
-            grep -i frb symbols.txt | head -20 || echo "(none)"
-            echo "--- binary info ---"
-            file "$BIN" || true
+          # --require-frb: 没有 frb* 符号就以非零退出，这是本步骤的判据。
+          # set +e 包住它，否则 set -e 会在 RC=$? 之前就终止脚本。
+          set +e
+          python3 /tmp/machosym.py --require-frb "$BIN"
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::no frb* symbol in the main binary; the Rust core was linked but stripped"
+            echo "--- effective OTHER_LDFLAGS ---"
+            xcodebuild -showBuildSettings \
+              -workspace ios/Runner.xcworkspace \
+              -scheme Runner \
+              -configuration Release 2>/dev/null \
+              | grep -i 'OTHER_LDFLAGS' || true
+            echo "--- DEAD_CODE_STRIPPING as Xcode sees it ---"
+            xcodebuild -showBuildSettings \
+              -workspace ios/Runner.xcworkspace \
+              -scheme Runner \
+              -configuration Release 2>/dev/null \
+              | grep -i 'DEAD_CODE_STRIPPING' || true
+            echo "--- staticlib, for comparison ---"
+            python3 /tmp/machosym.py "$RUST_LIB_REL" || true
             exit 1
           fi
 
-          echo "--- binary info ---"
-          ls -lh "$BIN"
-          file "$BIN"
+          echo "OK: Rust symbols are in the main binary"
+
           echo "--- dynamic deps (must NOT list libfqapi_core) ---"
           otool -L "$BIN" | head -20
 

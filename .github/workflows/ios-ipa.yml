@@ -152,6 +152,19 @@ jobs:
           test -s "$LIB" || { echo "::error::static lib not produced: $LIB"; exit 1; }
           ls -lh "$LIB"
 
+          # 用最原始的方式验证归档里有没有 FRB 符号：直接搜字符串。
+          # nm/llvm-nm 在 runner 上不可靠（可能不存在或读不了 LLVM23 DWARF），
+          # 但符号名在 .o 的符号表里是明文字符串，grep -a 一定能看到。
+          echo "=== raw symbol string scan of the archive ==="
+          for s in frb_get_rust_content_hash store_dart_post_cobject frb_dart_opaque; do
+            n=$(grep -a -c "$s" "$LIB" 2>/dev/null || echo 0)
+            echo "  $s -> $n occurrence(s) in archive"
+          done
+          echo "=== archive member count ==="
+          ar -t "$LIB" 2>/dev/null | wc -l || echo "(ar failed)"
+          echo "=== sample members ==="
+          ar -t "$LIB" 2>/dev/null | head -5 || true
+
           # Do NOT use Xcode's nm on this archive: Rust 1.99.1 emits LLVM 23
           # DWARF (attribute kind 102) which Xcode 16.4's nm (LLVM 17) cannot
           # parse; it errors on every object and looks like a build failure.
@@ -478,7 +491,15 @@ jobs:
           fi
           echo "symbol lines: $(wc -l < symbols.txt || echo 0)"
 
-          if grep -q "frb_get_rust_content_hash" symbols.txt; then
+          # nm 在 runner 上不可靠，这里直接用二进制字符串扫描做兜底判定。
+          echo "=== raw scan of the main binary ==="
+          for s in frb_get_rust_content_hash store_dart_post_cobject fqapi_core; do
+            n=$(grep -a -c "$s" "$BIN" 2>/dev/null || echo 0)
+            echo "  $s -> $n occurrence(s)"
+          done
+
+          if grep -q "frb_get_rust_content_hash" symbols.txt \
+             || grep -aq "frb_get_rust_content_hash" "$BIN"; then
             echo "OK: Rust symbols linked into the main binary"
             echo "frb_* symbol count: $(grep -c 'frb_' symbols.txt || true)"
           else

@@ -434,6 +434,34 @@ class ApiClient {
     return _decodeAsync(r);
   }
 
+  /// Ask the core to download (and, when [keyHex] is set, decrypt) one media
+  /// file and return a loopback URL that serves it with Range support.
+  ///
+  /// Android decrypts while streaming through its native CENC library, so it
+  /// never needs this. iOS has no decryptor and `AVPlayer` cannot read CENC, so
+  /// the core has to produce plaintext first. Returns an absolute URL ready for
+  /// the native player.
+  Future<String> localMedia({
+    required String url,
+    required String id,
+    String keyHex = '',
+  }) async {
+    final r = await _get(
+      _url('/api/v1/media/local', {
+        'url': url,
+        'id': id,
+        if (keyHex.isNotEmpty) 'key_hex': keyHex,
+      }),
+    );
+    final decoded = await _decodeAsync(r);
+    final data = decoded['data'];
+    final served = data is Map ? '${data['url'] ?? ''}'.trim() : '';
+    if (served.isEmpty) {
+      throw ApiException('获取本地播放地址失败');
+    }
+    return absoluteUrl(served);
+  }
+
   /// Resolve the playable audio model for [itemId].
   ///
   /// A book ID is required: the `/api/content` speech bridge returns subtitles

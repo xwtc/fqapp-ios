@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 
 import 'package:flutter/services.dart';
 
+import 'api_client.dart';
 import 'app_log.dart';
 import 'player_preferences.dart';
 
@@ -261,6 +263,44 @@ class NativePlayer {
     return _createFuture ??= _create(cdnUrl, keyHex);
   }
 
+  /// URL the native player can actually open.
+  ///
+  /// Android decrypts CENC while streaming, so the CDN URL is played as-is.
+  /// iOS has no decryptor and AVPlayer cannot read CENC, so encrypted sources
+  /// are handed to the core once: it downloads, decrypts in place, and serves
+  /// the plaintext over loopback with Range support. The returned URL is then
+  /// the same shape the backend already uses for cached video (`/src/...`).
+  static Future<String> _playableUrl(String cdnUrl, String keyHex) async {
+    if (!Platform.isIOS) return cdnUrl;
+    final uri = Uri.tryParse(cdnUrl);
+    // Loopback `/src/...` URLs are already plaintext: the core wrote them.
+    if (uri == null) return cdnUrl;
+    final localHost = uri.host == '127.0.0.1' || uri.host == 'localhost';
+    if (localHost && uri.path.startsWith('/src/')) return cdnUrl;
+
+    final encrypted = keyHex.trim().isNotEmpty;
+    try {
+      return await ApiClient.instance.localMedia(
+        url: cdnUrl,
+        // The file name is derived from the URL; the episode id is not always
+        // available here and the URL is stable per rendition.
+        id: _localIdFor(uri),
+        keyHex: encrypted ? keyHex.trim() : '',
+      );
+    } catch (_) {
+      // Falling back to the CDN URL keeps unencrypted sources working even if
+      // the local cache step fails; an encrypted source will then fail with a
+      // decoder error, which is more informative than a create() failure.
+      return cdnUrl;
+    }
+  }
+
+  static String _localIdFor(Uri uri) {
+    final last = uri.pathSegments.isEmpty ? '' : uri.pathSegments.last;
+    final stem = last.split('.').first;
+    return stem.isEmpty ? 'media' : stem;
+  }
+
   Future<int> _create(String cdnUrl, String keyHex) async {
     _ensureGlobalListener();
     // Disposal or an early native error can finish this future before the
@@ -268,10 +308,14 @@ class NativePlayer {
     // propagates them to create's caller.
     _createdCompleter.future.ignore();
     try {
+      final playable = await _playableUrl(cdnUrl, keyHex);
+      // iOS is handed plaintext from the core, so the key must not be sent: a
+      // host that tried to decrypt again would corrupt the stream.
+      final sendKey = Platform.isIOS ? '' : keyHex;
       final reply = _channel
           .invokeMapMethod<String, dynamic>('create', {
-            'cdnUrl': cdnUrl,
-            'keyHex': keyHex,
+            'cdnUrl': playable,
+            'keyHex': sendKey,
             // 解码器偏好必须是**已解析的值**，不能在这里 await 读盘：create 位于
             // 起播的关键路径上，等 SharedPreferences 会让没有初始化插件的测试
             // （以及冷启动）一直挂住。偏好由 `DecoderPreferenceCache` 在启动和

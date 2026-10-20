@@ -1206,6 +1206,26 @@ async fn stream_download_to_file(
     stream_download_to_file_with_cap(url, user_agent, part_path, MAX_VIDEO_DOWNLOAD_BYTES).await
 }
 
+/// Streams a media body to `part_path` with the browser UA the CDN expects.
+///
+/// Exposed for `media_local`, which needs the same bounded streaming download
+/// for audio (there is no separate audio downloader in the core).
+pub(crate) async fn stream_media_to_file(
+    url: &str,
+    part_path: &Path,
+    cap_bytes: u64,
+) -> Result<u64, String> {
+    stream_download_to_file_with_cap(url, UA_WINDOWS_BROWSER, part_path, cap_bytes).await
+}
+
+/// Decrypts CENC AES-CTR in place, preserving every byte offset.
+///
+/// Exposed for `media_local`: iOS has no native decryptor, so the core must
+/// produce plaintext before AVPlayer can read it.
+pub(crate) fn decrypt_cenc_in_place(data: &mut [u8], content_key: &[u8]) -> Result<(), String> {
+    decrypt_cenc_mp4(data, content_key)
+}
+
 async fn stream_download_to_file_with_cap(
     url: &str,
     user_agent: &str,

@@ -694,6 +694,33 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PLIST"
 
+      # ---------------------------------------------------------------
+      # 原生播放器（iOS）
+      #
+      # 听书、短剧、阅读页内嵌视频全都走 `fqapp/native_player` 通道；
+      # Android 由 NativePlayerPlugin.kt（ExoPlayer + CENC 流式解密）实现，
+      # iOS 侧此前完全没有对应实现，所以 Dart 调用 create 会直接抛
+      # MissingPluginException —— 表现为"音频也无法播放"。
+      #
+      # 这里把 Swift 实现复制进 Runner target 并注册。CENC 解密不在 Swift
+      # 里重做：Rust 核心已经能下载 + 原地解密 + 通过 /src/ 带 Range 提供
+      # 明文（见 rust/src/endpoints/media_local.rs），Dart 侧拿到的是明文
+      # URL，AVPlayer 直接能播。
+      # ---------------------------------------------------------------
+      - name: Install the native player
+        run: |
+          set -eo pipefail
+          SRC=ios-porting/native-player
+          ls -l "$SRC"
+          cp "$SRC/NativePlayerPlugin.swift" ios/Runner/
+          cp "$SRC/NativePlayerRegistrar.swift" ios/Runner/
+          python3 "$SRC/inject_native_player.py"
+
+          echo "=== verify the sources are in the target ==="
+          grep -c 'NativePlayerPlugin.swift' ios/Runner.xcodeproj/project.pbxproj
+          grep -c 'NativePlayerRegistrar' ios/Runner/AppDelegate.swift
+          grep -c 'NSAllowsLocalNetworking' ios/Runner/Info.plist
+
       # iOS 主屏图标下显示的是 CFBundleDisplayName。flutter create 用
       # --project-name fqapp 生成后这里是 "Fqapp"，和 Android 的
       # android:label="fqapp" 对不上，装到桌面上一眼能看出是移植版。

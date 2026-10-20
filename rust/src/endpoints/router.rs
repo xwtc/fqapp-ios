@@ -43,12 +43,26 @@ pub fn match_rest_path(path: &str, query: &Params) -> Option<RouteMatch> {
         "articles" => match_articles(tail, query),
         "items" => match_items(tail, query),
         "comments" => match_comments(tail, query),
+        // Decrypted local media for platforms without a native CENC decryptor
+        // (iOS AVPlayer). Android keeps decrypting in its streaming source.
+        "media" => match_media(tail, query),
         "forum-id" => Some(RouteMatch {
             api: "forum_id",
             params: query.clone(),
         }),
         _ => None,
     }
+}
+
+fn match_media(parts: &[&str], q: &Params) -> Option<RouteMatch> {
+    // `/api/v1/media/local?url=...&key_hex=...&id=...`
+    if parts.first() == Some(&"local") {
+        return Some(RouteMatch {
+            api: "media_local",
+            params: q.clone(),
+        });
+    }
+    None
 }
 
 fn match_chapters(parts: &[&str], q: &Params) -> Option<RouteMatch> {

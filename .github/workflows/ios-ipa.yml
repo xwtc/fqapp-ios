@@ -29,6 +29,10 @@ on:
         description: '跳过 FRB codegen（绑定已提交，可省约 8 分钟）'
         type: boolean
         default: true
+      use_lockfile:
+        description: '严格使用 pubspec.lock（避免依赖解析到新的不兼容版本）'
+        type: boolean
+        default: false
   push:
     branches: [master, ios]
     # 刻意不把 .github/workflows/ios-ipa.yml 放进 paths：
@@ -281,7 +285,16 @@ jobs:
           grep -n "_externalLibraryForPlatform" lib/services/backend_transport.dart
 
       - name: Resolve Dart dependencies
-        run: flutter pub get
+        run: |
+          # 默认按 pubspec.yaml 的范围解析（会拿到 connectivity_plus 7.3.2）。
+          # 打开 use_lockfile 时严格按 pubspec.lock（7.3.1，不含 iOS 26 API），
+          # 可在 macos-14/15 上构建。
+          if [ "${{ inputs.use_lockfile }}" = "true" ]; then
+            flutter pub get --enforce-lockfile
+          else
+            flutter pub get
+          fi
+          grep -A2 '^  connectivity_plus:' pubspec.lock | head -8 || true
 
       - name: Build iOS (no codesign)
         run: |

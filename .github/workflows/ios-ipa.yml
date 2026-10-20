@@ -113,13 +113,16 @@ jobs:
           cache: true
 
       # 仓库没有 ios/ 目录，只补平台目录，不动 lib/ 与 pubspec.yaml。
+      # 注意：shell 代码行一律用 ASCII，中文只写在 YAML 注释里。
+      # 之前用中文 echo + Windows 写入，GBK 字节破坏了 xcconfig 的换行，
+      # 导致 OTHER_LDFLAGS 被并入注释、链接参数静默失效。
       - name: Generate the iOS project if missing
         run: |
           if [ ! -d ios ]; then
-            echo "ios/ 不存在，生成 Flutter iOS 工程"
+            echo "ios/ missing; generating Flutter iOS project"
             flutter create --platforms=ios --org com.fqapp --project-name fqapp .
           else
-            echo "ios/ 已存在，跳过生成"
+            echo "ios/ exists; skipping"
           fi
           ls -la ios
 
@@ -135,51 +138,46 @@ jobs:
           set -euo pipefail
           START=$(date +%s)
           cargo build --manifest-path rust/Cargo.toml --release --target "$RUST_TARGET"
-          echo "cargo build 耗时: $(( $(date +%s) - START ))s"
+          echo "cargo build elapsed: $(( $(date +%s) - START ))s"
 
           LIB="$RUST_LIB_REL"
-          test -s "$LIB" || { echo "::error::静态库未产出：$LIB"; exit 1; }
+          test -s "$LIB" || { echo "::error::static lib not produced: $LIB"; exit 1; }
           ls -lh "$LIB"
 
-          # ⚠️ 不要用 Xcode 自带的 nm 检查这个静态库。
-          #    Rust 1.99.1 用 LLVM 23 编译，产物里的 DWARF 属性是 kind 102；
-          #    Xcode 16.4 的 nm 是 LLVM 17，读不懂，会对每个 .o 报
-          #    "Unknown attribute kind (102)"，看起来像编译失败，其实库是好的。
-          #    改用 Rust 工具链自带的 llvm-nm（同版本 LLVM）。
+          # Do NOT use Xcode's nm on this archive: Rust 1.99.1 emits LLVM 23
+          # DWARF (attribute kind 102) which Xcode 16.4's nm (LLVM 17) cannot
+          # parse; it errors on every object and looks like a build failure.
           SYSROOT=$(rustc --print sysroot)
           HOST=$(rustc -vV | sed -n 's/^host: //p')
           LLVM_NM="$SYSROOT/lib/rustlib/$HOST/bin/llvm-nm"
           if [ -x "$LLVM_NM" ]; then
             NM="$LLVM_NM"
-            echo "使用 Rust 自带 llvm-nm: $NM"
+            echo "using rustc bundled llvm-nm: $NM"
           else
             NM=$(command -v llvm-nm || true)
-            echo "::warning::未找到 Rust 自带的 llvm-nm，退回: ${NM:-（无）}"
+            echo "::warning::bundled llvm-nm not found, falling back to: ${NM:-none}"
           fi
 
           if [ -n "$NM" ]; then
-            echo "--- 检查 FRB 关键符号 ---"
+            echo "--- FRB symbols in archive ---"
             "$NM" -gU "$LIB" > nm.out 2>/dev/null || "$NM" -g "$LIB" > nm.out 2>/dev/null || true
             for symbol in frb_get_rust_content_hash store_dart_post_cobject; do
               if grep -Eq "[[:space:]]_?${symbol}$" nm.out; then
-                echo "  ✓ $symbol"
+                echo "  ok: $symbol"
               else
-                echo "::error::静态库缺少符号 $symbol"
+                echo "::error::missing symbol in archive: $symbol"
                 head -40 nm.out
                 exit 1
               fi
             done
-            echo "frb_* 符号总数: $(grep -c 'frb_' nm.out || true)"
+            echo "frb_* symbol count: $(grep -c 'frb_' nm.out || true)"
           else
-            # 没有可用的 nm 也不阻塞：ar 列出成员 + grep 原始字符串足够证明库非空。
-            echo "::warning::跳过符号检查（无可用 llvm-nm）"
+            echo "::warning::skipping symbol check (no llvm-nm available)"
             ar -t "$LIB" | head -5
-            echo "成员数: $(ar -t "$LIB" | wc -l)"
+            echo "member count: $(ar -t "$LIB" | wc -l)"
           fi
 
-          # 94MB 是未 strip 的 debug 信息。链接后由 Xcode 的 strip 处理，
-          # 这里先记录，便于对比最终二进制体积。
-          echo "静态库大小: $(du -h "$LIB" | cut -f1)"
+          echo "static lib size: $(du -h "$LIB" | cut -f1)"
 
       # ---------------------------------------------------------------
       # 链接配置：写进 Flutter 的 xcconfig，不走 CocoaPods
@@ -189,18 +187,30 @@ jobs:
           set -euo pipefail
           # $(SRCROOT) 对 Runner target 是 ios/，所以 ../rust/... 指向仓库根。
           # -Wl,-force_load,<path> 作为单个 token，避免路径含空格时被拆开。
+          #
+          # 重要：注释必须全部是 ASCII。
+          # 之前这里写中文注释，在 Windows 上被写成 GBK 字节，macOS 按 UTF-8
+          # 解析时末尾字符损坏成 "?"，把换行吞掉，导致下一行 OTHER_LDFLAGS
+          # 被并入注释 —— 链接参数静默失效，二进制里没有任何 frb_ 符号。
           FLAGS='OTHER_LDFLAGS = $(inherited) -Wl,-force_load,$(SRCROOT)/../rust/target/aarch64-apple-ios/release/libfqapi_core.a'
 
           for cfg in ios/Flutter/Release.xcconfig ios/Flutter/Debug.xcconfig; do
             if [ -f "$cfg" ]; then
               if ! grep -q 'force_load' "$cfg"; then
-                printf '\n// fqapp: Rust 核心静态链接（Dart 只按符号名查找，必须 force_load）\n%s\n' \
+                printf '\n// fqapp: static-link the Rust core (force_load required, Dart resolves symbols by name)\n%s\n' \
                   "$FLAGS" >> "$cfg"
               fi
               echo "--- $cfg ---"
               cat "$cfg"
+              echo "--- check: OTHER_LDFLAGS must be a live (uncommented) line ---"
+              if grep -qE '^OTHER_LDFLAGS *=.*force_load' "$cfg"; then
+                echo "  OK"
+              else
+                echo "::error::OTHER_LDFLAGS in $cfg is not an active line"
+                exit 1
+              fi
             else
-              echo "::warning::找不到 $cfg"
+              echo "::warning::missing $cfg"
             fi
           done
 
@@ -247,7 +257,7 @@ jobs:
                   "import 'package:http/http.dart' as http;",
                   1)
 
-          # 3) ensureRuntime 改为按平台注入 externalLibrary
+          # 3) ensureRuntime: inject externalLibrary per platform
           old = "  static Future<void> ensureRuntime() => _runtimeReady ??= RustLib.init();"
           new = (
               "  static Future<void> ensureRuntime() =>\n"
@@ -255,12 +265,13 @@ jobs:
               "        externalLibrary: _externalLibraryForPlatform(),\n"
               "      );\n"
               "\n"
-              "  /// iOS 上 Rust 核心静态链接进 Runner 主二进制（见 ios-ipa.yml 的\n"
-              "  /// -force_load），没有独立 dylib 可 open，必须在主二进制符号表里查找。\n"
-              "  /// 其他平台返回 null，沿用 flutter_rust_bridge 的默认加载器。\n"
+              "  /// On iOS the Rust core is statically linked into the Runner main\n"
+              "  /// binary (see -force_load in ios-ipa.yml). There is no dylib to\n"
+              "  /// open, so look the symbols up in the main binary itself.\n"
+              "  /// Other platforms return null and keep the default FRB loader.\n"
               "  static ExternalLibrary? _externalLibraryForPlatform() {\n"
               "    if (Platform.isIOS) {\n"
-              "      // 本进程内只有 fqapi_core 一个 flutter_rust_bridge 使用者。\n"
+              "      // fqapi_core is the only flutter_rust_bridge user in this process.\n"
               "      return ExternalLibrary.process(iKnowHowToUseIt: true);\n"
               "    }\n"
               "    return null;\n"
@@ -268,16 +279,16 @@ jobs:
           )
 
           if old not in src:
-              print("::error::找不到 ensureRuntime() 原文，上游可能已改动")
+              print("::error::ensureRuntime() original not found; upstream may have changed")
               sys.exit(1)
           src = src.replace(old, new, 1)
 
           if src == original:
-              print("::error::补丁没有产生任何改动")
+              print("::error::patch produced no change")
               sys.exit(1)
 
           p.write_text(src)
-          print("✓ 补丁已应用")
+          print("patch applied")
           PY
 
       - name: Verify the patch
@@ -301,7 +312,7 @@ jobs:
           s2 = re.sub(r'^(\s*connectivity_plus:\s*)\^?[0-9][^\s#]*',
                       r'\g<1>7.0.0', s, count=1, flags=re.M)
           if s2 == s:
-              print('::error::pubspec.yaml 里找不到 connectivity_plus 声明')
+              print('::error::connectivity_plus not declared in pubspec.yaml')
               raise SystemExit(1)
           p.write_text(s2)
           print('connectivity_plus -> 7.0.0')
@@ -310,14 +321,14 @@ jobs:
 
       - name: Resolve Dart dependencies
         run: |
-          # 默认按 pubspec.yaml 的范围解析（会拿到 connectivity_plus 7.3.2）。
-          # 打开 use_lockfile 时严格按 pubspec.lock。
+          # Default: resolve by pubspec.yaml ranges (picks connectivity_plus 7.3.2).
+          # use_lockfile: strictly follow pubspec.lock.
           if [ "${{ inputs.use_lockfile }}" = "true" ]; then
             flutter pub get --enforce-lockfile
           else
             flutter pub get
           fi
-          echo "--- 实际解析到的 connectivity_plus ---"
+          echo "--- resolved connectivity_plus ---"
           grep -A3 '^  connectivity_plus:' pubspec.lock | head -8 || true
 
       - name: Build iOS (no codesign)
@@ -329,14 +340,13 @@ jobs:
       # 关键校验：不用装机就能知道静态链接成没成。
       - name: Verify the Rust symbols reached the main binary
         run: |
-          # 不用 -u：rustc 不在 PATH 时变量为空会让脚本立刻退出，
-          # 而我们要的是打印诊断信息而不是无声失败。
+          # No -u: an empty var must print diagnostics, not exit silently.
           set -eo pipefail
           BIN=build/ios/iphoneos/Runner.app/Runner
           echo "BIN=$BIN"
-          ls -lh "$BIN" || { echo "::error::找不到主二进制 $BIN"; ls -R build/ios/iphoneos/ | head -40; exit 1; }
+          ls -lh "$BIN" || { echo "::error::main binary not found: $BIN"; ls -R build/ios/iphoneos/ | head -40; exit 1; }
 
-          echo "--- 工具探测 ---"
+          echo "--- tool discovery ---"
           echo "rustc: $(command -v rustc || echo '(not found)')"
           SYSROOT="$(rustc --print sysroot 2>/dev/null || true)"
           HOST="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p' || true)"
@@ -344,44 +354,46 @@ jobs:
           echo "HOST=$HOST"
 
           NM=""
-          if [ -n "$SYSROOT" ] && [ -n "$HOST" ] && [ -x "$SYSROOT/lib/rustlib/$HOST/bin/llvm-nm" ]; then
-            NM="$SYSROOT/lib/rustlib/$HOST/bin/llvm-nm"
-          elif command -v llvm-nm >/dev/null 2>&1; then
-            NM="$(command -v llvm-nm)"
-          elif [ -x /opt/homebrew/opt/llvm/bin/llvm-nm ]; then
-            NM=/opt/homebrew/opt/llvm/bin/llvm-nm
-          fi
+          for cand in \
+            "$SYSROOT/lib/rustlib/$HOST/bin/llvm-nm" \
+            "$SYSROOT/lib/rustlib/$HOST/bin/rust-llvm-nm" \
+            "$(command -v llvm-nm 2>/dev/null || true)" \
+            /opt/homebrew/opt/llvm/bin/llvm-nm \
+            /usr/local/opt/llvm/bin/llvm-nm
+          do
+            if [ -n "$cand" ] && [ -x "$cand" ]; then NM="$cand"; break; fi
+          done
           echo "NM=$NM"
 
-          # 优先用 llvm-nm；没有就退回 Xcode 的 nm（主二进制是 ld 产物，
-          # 不含 Rust 的 DWARF，Xcode nm 能读）。
+          # Prefer llvm-nm; fall back to Xcode nm (the main binary is an ld
+          # product and carries no Rust DWARF, so Xcode nm can read it).
           if [ -n "$NM" ]; then
             "$NM" -gU "$BIN" > symbols.txt 2>/dev/null || "$NM" -g "$BIN" > symbols.txt 2>/dev/null || true
           fi
           if [ ! -s symbols.txt ]; then
-            echo "llvm-nm 不可用或输出为空，退回 nm -gU"
+            echo "llvm-nm unavailable or empty; falling back to nm -gU"
             nm -gU "$BIN" > symbols.txt 2>/dev/null || nm -g "$BIN" > symbols.txt 2>/dev/null || true
           fi
-          echo "符号行数: $(wc -l < symbols.txt || echo 0)"
+          echo "symbol lines: $(wc -l < symbols.txt || echo 0)"
 
           if grep -q "frb_get_rust_content_hash" symbols.txt; then
-            echo "✅ Rust 符号已链接进主二进制"
-            echo "frb_* 符号数量: $(grep -c 'frb_' symbols.txt || true)"
+            echo "OK: Rust symbols linked into the main binary"
+            echo "frb_* symbol count: $(grep -c 'frb_' symbols.txt || true)"
           else
-            echo "::error::主二进制里找不到 Rust 符号，force_load 未生效"
-            echo "--- 当前链接参数 ---"
+            echo "::error::no Rust symbols in the main binary; force_load did not take effect"
+            echo "--- current link flags ---"
             cat ios/Flutter/Release.xcconfig || true
-            echo "--- 二进制里 frb_ 相关符号 ---"
-            grep -i frb symbols.txt | head -20 || echo "(无)"
-            echo "--- 二进制信息 ---"
+            echo "--- frb symbols found ---"
+            grep -i frb symbols.txt | head -20 || echo "(none)"
+            echo "--- binary info ---"
             file "$BIN" || true
             exit 1
           fi
 
-          echo "--- 二进制信息 ---"
+          echo "--- binary info ---"
           ls -lh "$BIN"
           file "$BIN"
-          echo "--- 动态依赖（应无 libfqapi_core）---"
+          echo "--- dynamic deps (must NOT list libfqapi_core) ---"
           otool -L "$BIN" | head -20
 
       # 即使符号校验失败也打包：先拿到能装的 IPA 验证端到端链路，
@@ -391,7 +403,7 @@ jobs:
         run: |
           set -eo pipefail
           if [ ! -d build/ios/iphoneos/Runner.app ]; then
-            echo "::warning::没有 Runner.app，跳过打包"
+            echo "::warning::no Runner.app; skipping packaging"
             exit 0
           fi
           VERSION=$(grep -m1 '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*//' | tr '+' '-')

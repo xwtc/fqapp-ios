@@ -194,46 +194,98 @@ jobs:
           echo "LIB_ABS=$LIB_ABS"
           ls -lh "$LIB_ABS" || { echo "::error::static lib missing"; exit 1; }
 
-          python3 - "$LIB_ABS" <<'PY'
+          PBX=ios/Runner.xcodeproj/project.pbxproj
+          echo "=== pbxproj: XCBuildConfiguration blocks ==="
+          grep -nE 'isa = XCBuildConfiguration|PRODUCT_BUNDLE_IDENTIFIER|name = (Debug|Release|Profile);' "$PBX" | head -40
+
+          python3 - "$LIB_ABS" "$PBX" <<'PY'
           import sys, pathlib
 
-          lib = sys.argv[1]
+          lib, pbx_path = sys.argv[1], sys.argv[2]
           flag = '-Wl,-force_load,%s' % lib
-          p = pathlib.Path('ios/Runner.xcodeproj/project.pbxproj')
-          lines = p.read_text().split('\n')
+          p = pathlib.Path(pbx_path)
+          text = p.read_text()
 
+          if 'force_load' in text:
+              print('pbxproj already patched')
+              sys.exit(0)
+
+          inject = (
+              'buildSettings = {\n'
+              '\t\t\t\tOTHER_LDFLAGS = (\n'
+              '\t\t\t\t\t"$(inherited)",\n'
+              '\t\t\t\t\t"%s",\n'
+              '\t\t\t\t);' % flag
+          )
+
+          # Split into XCBuildConfiguration blocks by locating the isa line and
+          # walking to the matching closing brace.
+          idx = 0
           out = []
-          in_cfg = False
-          is_flutter_cfg = False
-          injected = 0
+          patched = 0
+          marker = 'isa = XCBuildConfiguration;'
+          while True:
+              i = text.find(marker, idx)
+              if i < 0:
+                  out.append(text[idx:])
+                  break
+              # find enclosing '{' before i
+              b = text.rfind('{', 0, i)
+              # find matching close brace
+              depth = 0
+              j = b
+              while j < len(text):
+                  if text[j] == '{':
+                      depth += 1
+                  elif text[j] == '}':
+                      depth -= 1
+                      if depth == 0:
+                          break
+                  j += 1
+              block = text[b:j+1]
+              # Only the app target: must carry the bundle id and not be a test target
+              if ('PRODUCT_BUNDLE_IDENTIFIER' in block
+                      and 'RunnerTests' not in block
+                      and 'buildSettings = {' in block):
+                  block = block.replace('buildSettings = {', inject, 1)
+                  patched += 1
+              out.append(text[idx:b])
+              out.append(block)
+              idx = j + 1
 
-          for line in lines:
-              out.append(line)
-              if 'isa = XCBuildConfiguration;' in line:
-                  in_cfg = True
-                  is_flutter_cfg = False
-              elif in_cfg and 'baseConfigurationReference' in line:
-                  if 'Flutter/' in line:
-                      is_flutter_cfg = True
-              elif in_cfg and line.strip() == 'buildSettings = {' and is_flutter_cfg:
-                  out.append('\t\t\t\tOTHER_LDFLAGS = (')
-                  out.append('\t\t\t\t\t"$(inherited)",')
-                  out.append('\t\t\t\t\t"%s",' % flag)
-                  out.append('\t\t\t\t);')
-                  injected += 1
-                  in_cfg = False
-                  is_flutter_cfg = False
-
-          p.write_text('\n'.join(out))
-          print('injected OTHER_LDFLAGS into %d build configurations' % injected)
-          if injected == 0:
-              print('::error::no Flutter build configuration found in pbxproj')
+          new_text = ''.join(out)
+          p.write_text(new_text)
+          print('patched %d configuration(s)' % patched)
+          if 'force_load' not in new_text:
+              print('::error::patch did not land in pbxproj')
               sys.exit(1)
           PY
 
-          echo "--- pbxproj check ---"
-          grep -c 'force_load' ios/Runner.xcodeproj/project.pbxproj || true
-          grep -n 'force_load' ios/Runner.xcodeproj/project.pbxproj | head -5
+          echo "=== after patch ==="
+          grep -c 'force_load' "$PBX" || true
+          grep -n -A4 'OTHER_LDFLAGS' "$PBX" | head -30
+
+      # 构建前先确认 Xcode 真的读到了这个设置。
+      # 这是决定性证据：如果 showBuildSettings 里没有 force_load，
+      # 说明注入位置不对，不必浪费时间跑完整构建。
+      - name: Verify Xcode sees the link flag
+        run: |
+          set -eo pipefail
+          flutter build ios --config-only --release --no-codesign 2>&1 | tail -10 || true
+          echo "=== OTHER_LDFLAGS as Xcode sees it ==="
+          SETTINGS=$(xcodebuild -showBuildSettings \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release 2>/dev/null || true)
+          echo "$SETTINGS" | grep -i 'OTHER_LDFLAGS' || echo "(NOT FOUND)"
+          echo "=== which config file does Runner use ==="
+          echo "$SETTINGS" | grep -iE 'baseConfigurationReference|CONFIGURATION_TEMP_DIR' | head -5 || true
+          if echo "$SETTINGS" | grep -qi 'force_load'; then
+            echo "OK: force_load is visible to Xcode"
+          else
+            echo "::error::force_load NOT visible to Xcode; link flag will not take effect"
+            exit 1
+          fi
 
       # 实测：pod install 之后 Xcode 实际看到的 OTHER_LDFLAGS 是什么。
       # 这一步是诊断，不通过也要继续，但结果决定后续怎么修。

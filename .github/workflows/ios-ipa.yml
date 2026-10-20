@@ -137,6 +137,14 @@ jobs:
         run: |
           set -euo pipefail
           START=$(date +%s)
+          # CRITICAL: rust/Cargo.toml sets `strip = true` under [profile.release].
+          # That is right for the Android cdylib but catastrophic for staticlib:
+          # it strips the archive's global symbol table, so -force_load pulls in
+          # objects that no longer export _frb_* / _store_dart_post_cobject.
+          # The result is a link that "succeeds" and a binary with zero Rust
+          # symbols. Override it here only for the iOS static build.
+          export CARGO_PROFILE_RELEASE_STRIP=none
+          echo "CARGO_PROFILE_RELEASE_STRIP=$CARGO_PROFILE_RELEASE_STRIP"
           cargo build --manifest-path rust/Cargo.toml --release --target "$RUST_TARGET"
           echo "cargo build elapsed: $(( $(date +%s) - START ))s"
 

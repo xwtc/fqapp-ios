@@ -694,6 +694,17 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PLIST"
 
+      # iOS 主屏图标下显示的是 CFBundleDisplayName。flutter create 用
+      # --project-name fqapp 生成后这里是 "Fqapp"，和 Android 的
+      # android:label="fqapp" 对不上，装到桌面上一眼能看出是移植版。
+      # 只改这一处：本地化 .strings 需要 Xcode 参与拷贝，留到确认能跑起来之后。
+      - name: Set the display name
+        run: |
+          PLIST=ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName fqapp" "$PLIST" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string fqapp" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$PLIST"
+
       # ---------------------------------------------------------------
       # FRB iOS 加载补丁
       # ---------------------------------------------------------------

@@ -60,11 +60,16 @@ env:
 
 jobs:
   ipa:
-    # macos-15 在免费额度下排队极久（实测 8 分钟仍 runner=null），
-    # macos-14 通常能立刻分到机器。Xcode 15.4 足够：
-    # 我们的 deployment target 是 iOS 15，不依赖 Xcode 16 的新特性。
-    # 若 macos-14 也不可用，可退回 ubuntu 用交叉编译（但需要额外工具链）。
-    runs-on: macos-14
+    # 必须用带 Xcode 26+ 的镜像。
+    # connectivity_plus 7.3.2 的 iOS 源码里写了
+    #   if #available(iOS 26.0, *), path.isUltraConstrained { ... }
+    # NWPath.isUltraConstrained 是 iOS 26 SDK 才有的符号，
+    # Xcode 15.4（macos-14）/ 16.4（macos-15）的 SDK 里都没有，必然编译失败。
+    # macos-26 自带 Xcode 26。
+    #
+    # 若 macos-26 不可用或排队过久，备选是降级 connectivity_plus 到不含该
+    # API 的版本（见 docs 里的说明），但那是改依赖，不如换 runner 干净。
+    runs-on: macos-26
     timeout-minutes: 90
 
     steps:

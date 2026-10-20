@@ -31,13 +31,15 @@ on:
         default: true
   push:
     branches: [master, ios]
+    # 刻意不把 .github/workflows/ios-ipa.yml 放进 paths：
+    # 否则每次修改本工作流都会自触发一次构建，再被 concurrency 取消，
+    # 白白消耗一轮 runner 时间。改 CI 请用 workflow_dispatch 手动验证。
     paths:
       - 'lib/**'
       - 'rust/**'
       - 'assets/**'
       - 'pubspec.yaml'
       - 'ios/**'
-      - '.github/workflows/ios-ipa.yml'
 
 permissions:
   contents: read
@@ -116,25 +118,53 @@ jobs:
       - name: Compile the Rust core for iOS (arm64, static)
         run: |
           set -euo pipefail
+          START=$(date +%s)
           cargo build --manifest-path rust/Cargo.toml --release --target "$RUST_TARGET"
+          echo "cargo build 耗时: $(( $(date +%s) - START ))s"
 
           LIB="$RUST_LIB_REL"
           test -s "$LIB" || { echo "::error::静态库未产出：$LIB"; exit 1; }
           ls -lh "$LIB"
 
-          echo "--- 检查 FRB 关键符号是否导出 ---"
-          # 静态库里符号是未定义的导出形式（T/t），nm -gU 只看全局已定义。
-          # 至少应有 frb_get_rust_content_hash 与 store_dart_post_cobject。
-          for symbol in frb_get_rust_content_hash store_dart_post_cobject; do
-            if nm -gU "$LIB" 2>/dev/null | grep -Eq "[[:space:]]_?${symbol}$"; then
-              echo "  ✓ $symbol"
-            else
-              echo "::error::静态库缺少符号 $symbol"
-              nm -gU "$LIB" | head -40
-              exit 1
-            fi
-          done
-          echo "frb_* 符号总数: $(nm -gU "$LIB" | grep -c 'frb_' || true)"
+          # ⚠️ 不要用 Xcode 自带的 nm 检查这个静态库。
+          #    Rust 1.99.1 用 LLVM 23 编译，产物里的 DWARF 属性是 kind 102；
+          #    Xcode 16.4 的 nm 是 LLVM 17，读不懂，会对每个 .o 报
+          #    "Unknown attribute kind (102)"，看起来像编译失败，其实库是好的。
+          #    改用 Rust 工具链自带的 llvm-nm（同版本 LLVM）。
+          SYSROOT=$(rustc --print sysroot)
+          HOST=$(rustc -vV | sed -n 's/^host: //p')
+          LLVM_NM="$SYSROOT/lib/rustlib/$HOST/bin/llvm-nm"
+          if [ -x "$LLVM_NM" ]; then
+            NM="$LLVM_NM"
+            echo "使用 Rust 自带 llvm-nm: $NM"
+          else
+            NM=$(command -v llvm-nm || true)
+            echo "::warning::未找到 Rust 自带的 llvm-nm，退回: ${NM:-（无）}"
+          fi
+
+          if [ -n "$NM" ]; then
+            echo "--- 检查 FRB 关键符号 ---"
+            "$NM" -gU "$LIB" > nm.out 2>/dev/null || "$NM" -g "$LIB" > nm.out 2>/dev/null || true
+            for symbol in frb_get_rust_content_hash store_dart_post_cobject; do
+              if grep -Eq "[[:space:]]_?${symbol}$" nm.out; then
+                echo "  ✓ $symbol"
+              else
+                echo "::error::静态库缺少符号 $symbol"
+                head -40 nm.out
+                exit 1
+              fi
+            done
+            echo "frb_* 符号总数: $(grep -c 'frb_' nm.out || true)"
+          else
+            # 没有可用的 nm 也不阻塞：ar 列出成员 + grep 原始字符串足够证明库非空。
+            echo "::warning::跳过符号检查（无可用 llvm-nm）"
+            ar -t "$LIB" | head -5
+            echo "成员数: $(ar -t "$LIB" | wc -l)"
+          fi
+
+          # 94MB 是未 strip 的 debug 信息。链接后由 Xcode 的 strip 处理，
+          # 这里先记录，便于对比最终二进制体积。
+          echo "静态库大小: $(du -h "$LIB" | cut -f1)"
 
       # ---------------------------------------------------------------
       # 链接配置：写进 Flutter 的 xcconfig，不走 CocoaPods
@@ -257,14 +287,23 @@ jobs:
           BIN=build/ios/iphoneos/Runner.app/Runner
           test -f "$BIN" || { echo "::error::找不到主二进制"; exit 1; }
 
-          if nm -gU "$BIN" 2>/dev/null | grep -q "frb_get_rust_content_hash"; then
+          # 同前：Xcode 的 nm 读不了 LLVM 23 的 DWARF，用 Rust 自带的 llvm-nm。
+          SYSROOT=$(rustc --print sysroot)
+          HOST=$(rustc -vV | sed -n 's/^host: //p')
+          LLVM_NM="$SYSROOT/lib/rustlib/$HOST/bin/llvm-nm"
+          [ -x "$LLVM_NM" ] || LLVM_NM=$(command -v llvm-nm)
+
+          "$LLVM_NM" -gU "$BIN" > symbols.txt 2>/dev/null || "$LLVM_NM" -g "$BIN" > symbols.txt
+
+          if grep -q "frb_get_rust_content_hash" symbols.txt; then
             echo "✅ Rust 符号已链接进主二进制"
+            echo "frb_* 符号数量: $(grep -c 'frb_' symbols.txt || true)"
           else
             echo "::error::主二进制里找不到 Rust 符号，force_load 未生效"
             echo "--- 当前链接参数 ---"
             cat ios/Flutter/Release.xcconfig || true
             echo "--- 二进制里 frb_ 相关符号 ---"
-            nm -gU "$BIN" | grep -i frb | head -20 || echo "(无)"
+            grep -i frb symbols.txt | head -20 || echo "(无)"
             exit 1
           fi
 

@@ -1,0 +1,308 @@
+name: iOS IPA (unsigned, LiveContainer / sideload)
+
+# 在 GitHub macOS runner 上从零产出「未签名 IPA」。
+# LiveContainer 安装时用自己的证书重签，所以这里刻意不做 codesign。
+#
+# 设计依据（全部来自实际读源码，不是模板）：
+#
+# 1) Rust 核心用静态库链接。
+#    iOS 不允许 dlopen 应用自带的 dylib；且 LiveContainer 重签时，
+#    单一二进制比嵌套 framework 的失败率低得多。
+#
+# 2) 静态链接必须 -force_load。
+#    Dart 只用 FFI 按符号名查找，链接器看不到任何静态引用，
+#    默认会把整个 .a 当死代码剥掉，运行时表现为 Failed to lookup symbol。
+#    这里不用 podspec，直接往 Flutter 的 Release.xcconfig 追加 OTHER_LDFLAGS，
+#    路径用 $(SRCROOT) 求值，避免 CocoaPods 沙箱与路径转义问题。
+#
+# 3) FRB 2.13 的 iOS 默认加载器只认 {stem}.framework（动态框架），
+#    见 frb_dart/lib/src/loader/_io.dart。静态链接场景必须改用
+#    ExternalLibrary.process()。补丁打在 backend_transport.dart
+#    的 ensureRuntime()，该文件是手写的，不是 @generated。
+#
+# 版本对齐：与仓库 .github/workflows/android-apk.yml 保持一致。
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_codegen:
+        description: '跳过 FRB codegen（绑定已提交，可省约 8 分钟）'
+        type: boolean
+        default: true
+  push:
+    branches: [master, ios]
+    paths:
+      - 'lib/**'
+      - 'rust/**'
+      - 'assets/**'
+      - 'pubspec.yaml'
+      - 'ios/**'
+      - '.github/workflows/ios-ipa.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: '3.44.6'
+  FRB_VERSION: '2.13.0'
+  RUST_TOOLCHAIN: '1.99.1'
+  RUST_TARGET: 'aarch64-apple-ios'
+  IOS_DEPLOYMENT_TARGET: '15.0'
+  # 相对仓库根目录的静态库路径
+  RUST_LIB_REL: 'rust/target/aarch64-apple-ios/release/libfqapi_core.a'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+          xcode-select -p
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+          targets: aarch64-apple-ios
+
+      - name: Cache the Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ios-${{ env.RUST_TARGET }}
+
+      - name: Install flutter_rust_bridge_codegen
+        if: ${{ inputs.skip_codegen == false }}
+        run: cargo install flutter_rust_bridge_codegen --version "$FRB_VERSION" --locked
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      # 仓库没有 ios/ 目录，只补平台目录，不动 lib/ 与 pubspec.yaml。
+      - name: Generate the iOS project if missing
+        run: |
+          if [ ! -d ios ]; then
+            echo "ios/ 不存在，生成 Flutter iOS 工程"
+            flutter create --platforms=ios --org com.fqapp --project-name fqapp .
+          else
+            echo "ios/ 已存在，跳过生成"
+          fi
+          ls -la ios
+
+      - name: Generate the bridge bindings
+        if: ${{ inputs.skip_codegen == false }}
+        run: flutter_rust_bridge_codegen generate --config-file flutter_rust_bridge.yaml
+
+      # ---------------------------------------------------------------
+      # Rust 静态库
+      # ---------------------------------------------------------------
+      - name: Compile the Rust core for iOS (arm64, static)
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path rust/Cargo.toml --release --target "$RUST_TARGET"
+
+          LIB="$RUST_LIB_REL"
+          test -s "$LIB" || { echo "::error::静态库未产出：$LIB"; exit 1; }
+          ls -lh "$LIB"
+
+          echo "--- 检查 FRB 关键符号是否导出 ---"
+          # 静态库里符号是未定义的导出形式（T/t），nm -gU 只看全局已定义。
+          # 至少应有 frb_get_rust_content_hash 与 store_dart_post_cobject。
+          for symbol in frb_get_rust_content_hash store_dart_post_cobject; do
+            if nm -gU "$LIB" 2>/dev/null | grep -Eq "[[:space:]]_?${symbol}$"; then
+              echo "  ✓ $symbol"
+            else
+              echo "::error::静态库缺少符号 $symbol"
+              nm -gU "$LIB" | head -40
+              exit 1
+            fi
+          done
+          echo "frb_* 符号总数: $(nm -gU "$LIB" | grep -c 'frb_' || true)"
+
+      # ---------------------------------------------------------------
+      # 链接配置：写进 Flutter 的 xcconfig，不走 CocoaPods
+      # ---------------------------------------------------------------
+      - name: Link the static library via xcconfig
+        run: |
+          set -euo pipefail
+          # $(SRCROOT) 对 Runner target 是 ios/，所以 ../rust/... 指向仓库根。
+          # -Wl,-force_load,<path> 作为单个 token，避免路径含空格时被拆开。
+          FLAGS='OTHER_LDFLAGS = $(inherited) -Wl,-force_load,$(SRCROOT)/../rust/target/aarch64-apple-ios/release/libfqapi_core.a'
+
+          for cfg in ios/Flutter/Release.xcconfig ios/Flutter/Debug.xcconfig; do
+            if [ -f "$cfg" ]; then
+              if ! grep -q 'force_load' "$cfg"; then
+                printf '\n// fqapp: Rust 核心静态链接（Dart 只按符号名查找，必须 force_load）\n%s\n' \
+                  "$FLAGS" >> "$cfg"
+              fi
+              echo "--- $cfg ---"
+              cat "$cfg"
+            else
+              echo "::warning::找不到 $cfg"
+            fi
+          done
+
+      - name: Bump the iOS deployment target
+        run: |
+          sed -i '' \
+            "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = ${IOS_DEPLOYMENT_TARGET};/g" \
+            ios/Runner.xcodeproj/project.pbxproj
+          grep -c "IPHONEOS_DEPLOYMENT_TARGET = ${IOS_DEPLOYMENT_TARGET}" \
+            ios/Runner.xcodeproj/project.pbxproj || true
+
+      # 听书需要后台音频。LiveContainer 下能否真正后台运行仍需实测。
+      - name: Enable background audio
+        run: |
+          PLIST=ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PLIST"
+
+      # ---------------------------------------------------------------
+      # FRB iOS 加载补丁
+      # ---------------------------------------------------------------
+      - name: Patch the FRB loader for iOS static linking
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+
+          p = pathlib.Path('lib/services/backend_transport.dart')
+          src = p.read_text()
+          original = src
+
+          # 1) dart:io 的 Platform
+          if "import 'dart:io' show Platform;" not in src:
+              src = src.replace(
+                  "import 'dart:async';\nimport 'dart:typed_data';",
+                  "import 'dart:async';\nimport 'dart:io' show Platform;\nimport 'dart:typed_data';",
+                  1)
+
+          # 2) ExternalLibrary
+          if 'flutter_rust_bridge_for_generated_io.dart' not in src:
+              src = src.replace(
+                  "import 'package:http/http.dart' as http;",
+                  "import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';\n"
+                  "import 'package:http/http.dart' as http;",
+                  1)
+
+          # 3) ensureRuntime 改为按平台注入 externalLibrary
+          old = "  static Future<void> ensureRuntime() => _runtimeReady ??= RustLib.init();"
+          new = (
+              "  static Future<void> ensureRuntime() =>\n"
+              "      _runtimeReady ??= RustLib.init(\n"
+              "        externalLibrary: _externalLibraryForPlatform(),\n"
+              "      );\n"
+              "\n"
+              "  /// iOS 上 Rust 核心静态链接进 Runner 主二进制（见 ios-ipa.yml 的\n"
+              "  /// -force_load），没有独立 dylib 可 open，必须在主二进制符号表里查找。\n"
+              "  /// 其他平台返回 null，沿用 flutter_rust_bridge 的默认加载器。\n"
+              "  static ExternalLibrary? _externalLibraryForPlatform() {\n"
+              "    if (Platform.isIOS) {\n"
+              "      // 本进程内只有 fqapi_core 一个 flutter_rust_bridge 使用者。\n"
+              "      return ExternalLibrary.process(iKnowHowToUseIt: true);\n"
+              "    }\n"
+              "    return null;\n"
+              "  }"
+          )
+
+          if old not in src:
+              print("::error::找不到 ensureRuntime() 原文，上游可能已改动")
+              sys.exit(1)
+          src = src.replace(old, new, 1)
+
+          if src == original:
+              print("::error::补丁没有产生任何改动")
+              sys.exit(1)
+
+          p.write_text(src)
+          print("✓ 补丁已应用")
+          PY
+
+      - name: Verify the patch
+        run: |
+          grep -n "ExternalLibrary.process" lib/services/backend_transport.dart
+          grep -n "import 'dart:io' show Platform;" lib/services/backend_transport.dart
+          grep -n "_externalLibraryForPlatform" lib/services/backend_transport.dart
+
+      - name: Resolve Dart dependencies
+        run: flutter pub get
+
+      - name: Build iOS (no codesign)
+        run: |
+          set -o pipefail
+          flutter build ios --release --no-codesign 2>&1 | tee build.log
+          ls -la build/ios/iphoneos/
+
+      # 关键校验：不用装机就能知道静态链接成没成。
+      - name: Verify the Rust symbols reached the main binary
+        run: |
+          set -euo pipefail
+          BIN=build/ios/iphoneos/Runner.app/Runner
+          test -f "$BIN" || { echo "::error::找不到主二进制"; exit 1; }
+
+          if nm -gU "$BIN" 2>/dev/null | grep -q "frb_get_rust_content_hash"; then
+            echo "✅ Rust 符号已链接进主二进制"
+          else
+            echo "::error::主二进制里找不到 Rust 符号，force_load 未生效"
+            echo "--- 当前链接参数 ---"
+            cat ios/Flutter/Release.xcconfig || true
+            echo "--- 二进制里 frb_ 相关符号 ---"
+            nm -gU "$BIN" | grep -i frb | head -20 || echo "(无)"
+            exit 1
+          fi
+
+          echo "--- 二进制信息 ---"
+          ls -lh "$BIN"
+          file "$BIN"
+          echo "--- 动态依赖（应无 libfqapi_core）---"
+          otool -L "$BIN" | head -20
+
+      - name: Package the unsigned IPA
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*//' | tr '+' '-')
+          mkdir -p build/ipa/Payload
+          cp -R build/ios/iphoneos/Runner.app build/ipa/Payload/
+          cd build/ipa
+          zip -qry "fqapp-${VERSION}-unsigned.ipa" Payload
+          shasum -a 256 "fqapp-${VERSION}-unsigned.ipa" | tee SHA256SUMS
+          du -h "fqapp-${VERSION}-unsigned.ipa"
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: fqapp-ios-unsigned-${{ github.run_number }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            build/ipa/*.ipa
+            build/ipa/SHA256SUMS
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fqapp-ios-diagnostics-${{ github.run_number }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            build.log
+            ios/Flutter/*.xcconfig
+            ios/Podfile

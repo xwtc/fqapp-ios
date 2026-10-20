@@ -60,7 +60,11 @@ env:
 
 jobs:
   ipa:
-    runs-on: macos-15
+    # macos-15 在免费额度下排队极久（实测 8 分钟仍 runner=null），
+    # macos-14 通常能立刻分到机器。Xcode 15.4 足够：
+    # 我们的 deployment target 是 iOS 15，不依赖 Xcode 16 的新特性。
+    # 若 macos-14 也不可用，可退回 ubuntu 用交叉编译（但需要额外工具链）。
+    runs-on: macos-14
     timeout-minutes: 90
 
     steps:

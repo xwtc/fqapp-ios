@@ -149,26 +149,27 @@ def patch_app_delegate():
     # Flutter 3.44 uses the implicit-engine delegate; older templates call
     # configureFlutterEngine instead. Handle both so this survives a template
     # change without silently doing nothing.
+    #
+    # The registry expression is copied verbatim from the marker line rather
+    # than assumed: whatever the template passes to GeneratedPluginRegistrant is
+    # by definition the registry the engine exposes, and hard-coding a different
+    # expression is how this would break on the next Flutter upgrade.
     marker = 'GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)'
     if marker in text:
-        text = text.replace(
-            marker,
-            marker + '\n    NativePlayerRegistrar.register(with: engineBridge.pluginRegistry)',
-            1,
-        )
+        registry_expr = 'engineBridge.pluginRegistry'
     else:
         marker = 'GeneratedPluginRegistrant.register(with: registry)'
-        if marker in text:
-            text = text.replace(
-                marker,
-                marker + '\n    NativePlayerRegistrar.register(with: registry)',
-                1,
-            )
-        else:
+        if marker not in text:
             fail('no GeneratedPluginRegistrant call in AppDelegate; template changed')
+        registry_expr = 'registry'
 
+    text = text.replace(
+        marker,
+        marker + '\n    NativePlayerRegistrar.register(with: %s)' % registry_expr,
+        1,
+    )
     APP_DELEGATE.write_text(text)
-    print('AppDelegate patched')
+    print('AppDelegate patched (registry: %s)' % registry_expr)
 
 
 def patch_plist():

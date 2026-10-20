@@ -1,59 +1,13 @@
 name: Android APK
 
+# iOS port fork: the Android build is kept for manual verification only.
+#
+# Upstream runs it on every push that touches lib/ or rust/, which is right for
+# an Android-only project. In this fork the same paths change constantly for the
+# iOS port, so each push burned a full Android runner for an APK nobody uses
+# here. The workflow is unchanged otherwise: run it from the Actions tab when a
+# change to the shared Rust core needs an Android regression check.
 on:
-  push:
-    branches: [master]
-    # 打 tag 也出包：tag 推送不走 paths 过滤（native-crypto 在
-    # v1.0.117 tag 推送时已跑过一次可作证），branches/tags 是 OR 关系，
-    # 所以加 tags 后推 v* 就会触发一次完整构建，APK 在 Artifacts 里，
-    # 不用建 Release 也能拿到安装包。
-    tags: ['v*']
-    paths:
-      - 'lib/**'
-      - 'android/**'
-      - 'native/**'
-      - 'rust/**'
-      - 'assets/**'
-      - 'pubspec.yaml'
-      - 'pubspec.lock'
-      - 'analysis_options.yaml'
-      - 'test/**'
-      - 'flutter_rust_bridge.yaml'
-      - 'scripts/build_rust_backend.sh'
-      - 'scripts/build_rust_backend.ps1'
-      - 'scripts/run_rust_host_tests.sh'
-      - 'scripts/run_rust_host_tests.ps1'
-      - 'scripts/check_native_alignment.cjs'
-      - 'scripts/generate_app_icons.py'
-      - 'scripts/verify_android_apk.py'
-      - 'scripts/verify_audio_cenc.cjs'
-      - '.github/workflows/android-apk.yml'
-      - '.cargo/config.toml'
-  pull_request:
-    # Fork PRs receive no signing secrets, so the signing step degrades to an
-    # unsigned build instead of failing; the same paths filter keeps
-    # unrelated PRs from running the full build.
-    paths:
-      - 'lib/**'
-      - 'android/**'
-      - 'native/**'
-      - 'rust/**'
-      - 'assets/**'
-      - 'pubspec.yaml'
-      - 'pubspec.lock'
-      - 'analysis_options.yaml'
-      - 'test/**'
-      - 'flutter_rust_bridge.yaml'
-      - 'scripts/build_rust_backend.sh'
-      - 'scripts/build_rust_backend.ps1'
-      - 'scripts/run_rust_host_tests.sh'
-      - 'scripts/run_rust_host_tests.ps1'
-      - 'scripts/check_native_alignment.cjs'
-      - 'scripts/generate_app_icons.py'
-      - 'scripts/verify_android_apk.py'
-      - 'scripts/verify_audio_cenc.cjs'
-      - '.github/workflows/android-apk.yml'
-      - '.cargo/config.toml'
   workflow_dispatch:
 
 permissions:

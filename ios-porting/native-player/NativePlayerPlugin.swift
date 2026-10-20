@@ -31,7 +31,10 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
   private let player: AVPlayer
   private let videoOutput: AVPlayerItemVideoOutput
   private let registry: FlutterTextureRegistry
-  private weak var sink: FlutterEventSink?
+  // FlutterEventSink is a closure, so it cannot be weak. The plugin owns the
+  // sink and clears it in dispose(), which is what stops events from reaching a
+  // torn-down engine.
+  private var sink: FlutterEventSink?
 
   private(set) var textureId: Int64 = 0
   private var item: AVPlayerItem?
@@ -80,9 +83,11 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
 
     // Audio-only sources must keep playing when the screen locks: the app
     // declares UIBackgroundModes=audio and this session category is what makes
-    // the OS honour it.
+    // the OS honour it. `.playback` covers both the listening and video cases;
+    // a specific mode would only matter for AirPlay/ducking behaviour we do not
+    // use yet.
     do {
-      try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+      try AVAudioSession.sharedInstance().setCategory(.playback)
       try AVAudioSession.sharedInstance().setActive(true)
     } catch {
       // A missing session only costs background playback; do not fail create.
@@ -106,6 +111,11 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
   func play() {
     guard !disposed else { return }
     player.play()
+    // setRate on a paused player only records the intent; apply it now that
+    // playback is starting, otherwise a rate chosen before play would be lost.
+    if pendingRate != 1, player.rate != pendingRate {
+      player.rate = pendingRate
+    }
     publishPlaying()
   }
 
@@ -166,11 +176,12 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
       self.emitBuffering(item.isPlaybackBufferEmpty)
     }
 
-    rateObservation = player.observe(\.rate, options: [.new]) { [weak self] player, _ in
+    rateObservation = player.observe(\.rate, options: [.new]) { [weak self] _, _ in
       guard let self, !self.disposed else { return }
-      if player.rate != 0, self.pendingRate != player.rate {
-        player.rate = self.pendingRate
-      }
+      // Do NOT write player.rate here: this observer fires on every rate
+      // change, so re-applying the pending rate inside it would recurse.
+      // pendingRate is applied by play(), which is the only place a paused
+      // player legitimately starts.
       self.publishPlaying()
     }
 
@@ -188,9 +199,9 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
 
   private func startDisplayLink() {
     let link = CADisplayLink(target: self, selector: #selector(onFrame))
-    // 60 Hz is enough: Flutter samples the newest buffer, and a higher rate
-    // only burns battery on 120 Hz panels.
-    link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60)
+    // Default rate (the display's own refresh) is enough: Flutter samples the
+    // newest buffer, so a lower cadence would only add latency, and tuning
+    // preferredFrameRateRange buys nothing here.
     link.add(to: .main, forMode: .common)
     displayLink = link
   }
@@ -243,6 +254,8 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
 
   private func publishVideoSize() {
     guard !disposed, let item else { return }
+    // `tracks(withMediaType:)` is deprecated from iOS 16 but still the only
+    // synchronous accessor; the async replacement would race the first frame.
     let tracks = item.asset.tracks(withMediaType: .video)
     guard let track = tracks.first else { return }
 
@@ -273,7 +286,9 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
   /// the four values a RotatedBox can express.
   private func trackRotation(_ track: AVAssetTrack) -> Int {
     let t = track.preferredTransform
-    let degrees = Int((atan2(t.b, t.a) * 180 / .pi).rounded())
+    // A pure rotation has a == d and b == -c; anything else (mirroring, scale)
+    // is not something a quarter-turn RotatedBox can express.
+    let degrees = Int((atan2(t.b, t.a) * 180 / Double.pi).rounded())
     let normalised = ((degrees % 360) + 360) % 360
     return [0, 90, 180, 270].contains(normalised) ? normalised : 0
   }
@@ -354,7 +369,11 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
 }
 
 /// MethodChannel `fqapp/native_player` + EventChannel `fqapp/native_player/events`.
-public final class NativePlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
+///
+/// Not `public`: both files compile into the Runner target, so internal
+/// visibility is enough, and an ObjC protocol conformance on a `public` class
+/// would force every member to be `@objc`-exposed for no benefit.
+final class NativePlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
   private static let channelName = "fqapp/native_player"
   private static let eventName = "fqapp/native_player/events"
 
@@ -365,7 +384,7 @@ public final class NativePlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   private var registry: FlutterTextureRegistry?
   private var channel: FlutterMethodChannel?
 
-  public static func register(with registrar: FlutterPluginRegistrar) {
+  static func register(with registrar: FlutterPluginRegistrar) {
     let instance = NativePlayerPlugin()
     let channel = FlutterMethodChannel(name: channelName, binaryMessenger: registrar.messenger())
     let events = FlutterEventChannel(name: eventName, binaryMessenger: registrar.messenger())
@@ -375,7 +394,7 @@ public final class NativePlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     registrar.addMethodCallDelegate(instance, channel: channel)
   }
 
-  public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+  func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     let args = call.arguments as? [String: Any] ?? [:]
 
     switch call.method {
@@ -470,7 +489,7 @@ public final class NativePlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHan
 
   // MARK: - FlutterStreamHandler
 
-  public func onListen(
+  func onListen(
     withArguments arguments: Any?,
     eventSink events: @escaping FlutterEventSink
   ) -> FlutterError? {
@@ -479,13 +498,13 @@ public final class NativePlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     return nil
   }
 
-  public func onCancel(withArguments arguments: Any?) -> FlutterError? {
+  func onCancel(withArguments arguments: Any?) -> FlutterError? {
     eventSink = nil
     attachedToEngine = false
     return nil
   }
 
-  public func detachFromEngine(for registrar: FlutterPluginRegistrar) {
+  func detachFromEngine(for registrar: FlutterPluginRegistrar) {
     attachedToEngine = false
     eventSink = nil
     for player in players.values { player.dispose() }

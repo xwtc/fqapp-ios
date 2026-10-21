@@ -934,35 +934,35 @@ class _SeriesDetailPageState extends State<SeriesDetailPage> {
     final statusText = _episodes.isEmpty ? null : _episodeStatusText;
     final header = _sectionHeader(
       '选集',
-      trailing:
-          // No Flexible here: _sectionHeader itself is a Wrap, and a
-          // Flexible directly inside a Wrap is an illegal ParentDataWidget
-          // combination (threw in 26 tests). The inner Wrap sizes itself
-          // and the outer Wrap wraps the two children onto two lines
-          // when the title is long.
-          Wrap(
-          alignment: WrapAlignment.end,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          spacing: 8,
-          children: [
-            if (_detail.hasRelatedSeries)
-              TextButton(
-                key: const ValueKey('series-detail-related-series'),
-                onPressed: _openRelatedSeries,
-                style: TextButton.styleFrom(foregroundColor: Colors.white),
-                child: const Text('同系列'),
-              ),
-            if (statusText != null)
-              Text(
+      // Row, not Wrap: this block gains the status text the moment the episode
+      // list arrives, and a Wrap would break onto a second line then. The
+      // status is the part that gives way, so the row keeps one line and the
+      // grid below never moves under the user's finger.
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (_detail.hasRelatedSeries)
+            TextButton(
+              key: const ValueKey('series-detail-related-series'),
+              onPressed: _openRelatedSeries,
+              style: TextButton.styleFrom(foregroundColor: Colors.white),
+              child: const Text('同系列'),
+            ),
+          if (statusText != null)
+            Flexible(
+              child: Text(
                 statusText,
                 key: const ValueKey('series-episode-status'),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
                   fontSize: 12,
                   color: Color(0x66FFFFFF),
                 ),
               ),
-          ],
-        ),
+            ),
+        ],
+      ),
     );
     Widget body;
     if (_episodes.isEmpty) {
@@ -1036,15 +1036,21 @@ class _SeriesDetailPageState extends State<SeriesDetailPage> {
 
   /// 区块标题（官方 `cin.xml`/`a36.xml`：16sp 白粗）+ 可选灰色计数与右侧
   /// 入口。
+  /// Section title row.
+  ///
+  /// A Row, not a Wrap: the trailing block grows when the episode list arrives
+  /// (the status text goes from absent to "已完结 共105集"), and a Wrap would
+  /// push it onto a second line at that moment. That silently moved the whole
+  /// episode grid down while the user was aiming at a tile, which read as "the
+  /// grid got shoved away and I cannot tap it".
+  ///
+  /// The trailing side is Flexible so a long status shrinks instead of
+  /// wrapping, and the row height stays constant across the load.
   Widget _sectionHeader(
     String title, {
     String? leadingCount,
     Widget? trailing,
-  }) => Wrap(
-    alignment: WrapAlignment.spaceBetween,
-    crossAxisAlignment: WrapCrossAlignment.center,
-    spacing: 16,
-    runSpacing: 8,
+  }) => Row(
     children: [
       Text.rich(
         TextSpan(
@@ -1062,7 +1068,10 @@ class _SeriesDetailPageState extends State<SeriesDetailPage> {
         ),
         style: const TextStyle(fontSize: 16, color: Colors.white),
       ),
-      ?trailing,
+      if (trailing != null) ...[
+        const SizedBox(width: 16),
+        Flexible(child: Align(alignment: Alignment.centerRight, child: trailing)),
+      ],
     ],
   );
 

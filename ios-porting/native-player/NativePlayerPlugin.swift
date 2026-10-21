@@ -48,6 +48,8 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
   private var lastDurationMs: Int64 = -1
   private var lastVideoSize: CGSize = .zero
   private var disposed = false
+  /// A seek requested before the item was ready, applied on `.readyToPlay`.
+  private var pendingSeekMs: Int64?
 
   // AVPlayerItem.status/loadedTimeRanges are KVO-observed; keep the tokens so
   // detach can remove exactly the observations this instance added.
@@ -127,7 +129,21 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
 
   func seek(toMilliseconds ms: Int64) {
     guard !disposed else { return }
-    let time = CMTime(value: CMTimeValue(max(0, ms)), timescale: 1000)
+    let target = max(0, ms)
+    // AVPlayer drops a seek issued before the item is ready: `create()` returns
+    // as soon as the player exists, and the Dart side seeks immediately to
+    // restore a saved position. Without this deferral the restore silently
+    // lands on 0 and playback starts from the beginning.
+    guard item?.status == .readyToPlay else {
+      pendingSeekMs = target
+      return
+    }
+    performSeek(target)
+  }
+
+  private func performSeek(_ ms: Int64) {
+    pendingSeekMs = nil
+    let time = CMTime(value: CMTimeValue(ms), timescale: 1000)
     // Zero tolerance: the Dart side treats the seek as acknowledged once the
     // call returns and rewrites its own position, so a loose tolerance would
     // make the reported position drift from the picture.
@@ -164,6 +180,10 @@ final class NativePlayerInstance: NSObject, FlutterTexture {
         self.emit("buffering", value: false)
         self.publishDuration()
         self.publishVideoSize()
+        // Apply a restore seek that arrived before the item was playable.
+        if let pending = self.pendingSeekMs {
+          self.performSeek(pending)
+        }
       case .failed:
         self.emitError(item.error)
       default:

@@ -282,8 +282,10 @@ class NativePlayer {
     try {
       return await ApiClient.instance.localMedia(
         url: cdnUrl,
-        // The file name is derived from the URL; the episode id is not always
-        // available here and the URL is stable per rendition.
+        // Cosmetic only: the core keys its cache on a hash of the full URL, so
+        // a colliding or empty id cannot alias two different media files. This
+        // used to be a bare path stem and every episode ended up in the same
+        // file, which made all playback repeat the first video.
         id: _localIdFor(uri),
         keyHex: encrypted ? keyHex.trim() : '',
       );
@@ -295,6 +297,8 @@ class NativePlayer {
     }
   }
 
+  /// Readable hint for the cache file name. Uniqueness comes from the server
+  /// side hash, never from this value.
   static String _localIdFor(Uri uri) {
     final last = uri.pathSegments.isEmpty ? '' : uri.pathSegments.last;
     final stem = last.split('.').first;

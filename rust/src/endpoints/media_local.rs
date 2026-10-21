@@ -13,6 +13,7 @@
 
 use futures::future::BoxFuture;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 use crate::endpoints::{Ctx, Params, Server};
@@ -80,35 +81,52 @@ pub fn handle_media_local<'a>(
     })
 }
 
-/// Stable, filesystem-safe cache name. The caller may pass an explicit `id`
-/// (the episode id, which keeps the cache warm across quality changes);
-/// otherwise the URL's last path segment is used.
+/// Cache name for one media URL.
+///
+/// The name MUST be derived from the full URL, not just its last path segment.
+/// CDN media URLs frequently end in a directory, a generic name, or nothing at
+/// all, so a stem-only key made every episode resolve to `media.mp4`; the first
+/// download then answered every later request and the app played that one file
+/// for all content (including audio, which shares this cache).
+///
+/// The caller's `id` is kept only as a readable prefix. The hash is what
+/// guarantees uniqueness, so a bad or colliding id can never alias two files.
 fn local_id(params: &Params, url: &url::Url) -> String {
-    let raw = {
-        let given = params.get_str("id");
-        if given.trim().is_empty() {
-            url.path_segments()
-                .and_then(|s| s.last())
-                .unwrap_or("media")
-                .to_string()
-        } else {
-            given
-        }
+    let given = params.get_str("id");
+    let raw = if given.trim().is_empty() {
+        url.path_segments()
+            .and_then(|s| s.last())
+            .unwrap_or("media")
+            .to_string()
+    } else {
+        given
     };
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
+
+    // Strip the extension: `media_ext` re-adds a normalised one, and leaving it
+    // in would produce `clip.mp4-1a2b3c4d.mp4`.
+    let stem = raw.split('.').next().unwrap_or("media");
+    let mut prefix = String::with_capacity(stem.len());
+    for ch in stem.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            out.push(ch);
+            prefix.push(ch);
         } else {
-            out.push('_');
+            prefix.push('_');
         }
     }
-    if out.is_empty() {
-        out.push_str("media");
-    }
-    // Keep room for the extension and `.part` suffix.
-    out.truncate(96);
-    out
+    let prefix = prefix.trim_matches('_');
+    let prefix = if prefix.is_empty() { "media" } else { prefix };
+    // Every byte pushed above is ASCII (anything else became '_'), so a byte
+    // slice here cannot split a UTF-8 scalar. The explicit filter keeps that
+    // true if the loop ever changes.
+    debug_assert!(prefix.is_ascii());
+    let prefix = &prefix[..prefix.len().min(64)];
+
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_str().as_bytes());
+    let digest = hasher.finalize();
+    let hash: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+
+    format!("{prefix}-{hash}")
 }
 
 async fn ensure_local_media(
@@ -196,4 +214,86 @@ fn media_ext(url: &str) -> String {
 /// Registers the decrypted-media endpoint.
 pub fn register(s: &mut Server) {
     s.add_route("media_local", handle_media_local);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(pairs: &[(&str, &str)]) -> Params {
+        let mut p = Params::new();
+        for (k, v) in pairs {
+            p.set(k, v);
+        }
+        p
+    }
+
+    fn url(raw: &str) -> url::Url {
+        url::Url::parse(raw).expect("test url")
+    }
+
+    /// The bug this guards: every CDN URL used to collapse to the same cache
+    /// name, so the first download answered every later request and the app
+    /// replayed that one file for all content.
+    #[test]
+    fn different_urls_never_share_a_cache_name() {
+        let a = url("https://cdn.test/video/abc/ep1.mp4");
+        let b = url("https://cdn.test/video/abc/ep2.mp4");
+        let c = url("https://cdn.test/audio/xyz/tone0.m4a");
+        let names = [
+            local_id(&params(&[("id", "ep1")]), &a),
+            local_id(&params(&[("id", "ep2")]), &b),
+            local_id(&params(&[("id", "tone0")]), &c),
+        ];
+        for (i, x) in names.iter().enumerate() {
+            for y in names.iter().skip(i + 1) {
+                assert_ne!(x, y, "cache names collided: {x} == {y}");
+            }
+        }
+    }
+
+    /// A caller-supplied id that collides (or is missing) must not alias two
+    /// different URLs: the hash is the discriminator.
+    #[test]
+    fn same_id_with_different_urls_still_differs() {
+        let a = url("https://cdn.test/a.mp4");
+        let b = url("https://cdn.test/b.mp4");
+        let p = params(&[("id", "media")]);
+        assert_ne!(local_id(&p, &a), local_id(&p, &b));
+    }
+
+    /// The same URL must map to the same name, or the cache never hits.
+    #[test]
+    fn same_url_is_stable() {
+        let a = url("https://cdn.test/video/abc/ep1.mp4");
+        let p = params(&[("id", "ep1")]);
+        assert_eq!(local_id(&p, &a), local_id(&p, &a));
+    }
+
+    /// URLs that end in a directory or carry a query are the cases the old
+    /// stem-only key got wrong.
+    #[test]
+    fn urls_without_a_filename_still_differ() {
+        let a = url("https://cdn.test/video/abc/");
+        let b = url("https://cdn.test/video/def/");
+        assert_ne!(local_id(&params(&[]), &a), local_id(&params(&[]), &b));
+
+        let c = url("https://cdn.test/play?episode=1");
+        let d = url("https://cdn.test/play?episode=2");
+        assert_ne!(local_id(&params(&[]), &c), local_id(&params(&[]), &d));
+    }
+
+    /// The name must stay filesystem-safe: only ASCII alnum, '-' and '_'.
+    #[test]
+    fn cache_name_is_filesystem_safe() {
+        let u = url("https://cdn.test/video/%E4%B8%AD%E6%96%87/clip.mp4?x=1");
+        let name = local_id(&params(&[("id", "../../etc/passwd")]), &u);
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "unsafe cache name: {name}"
+        );
+        assert!(!name.contains(".."), "path traversal in {name}");
+        assert!(!name.contains('/'), "path separator in {name}");
+    }
 }
